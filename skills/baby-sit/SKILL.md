@@ -35,7 +35,7 @@ Run `scripts/pr-status.sh N` and act on `nextAction`:
 Use the first mode your environment supports, and say which one you're using in your first progress line.
 
 1. **A PR watch tool exists** (T3 Code's `watch_pull_request`): call it once. On a `wait` with `wakeOnEvent: true`, end your turn; the watcher wakes you when checks finish, someone comments or reviews, or the branch conflicts. On each wake, run one check and act on it. Before the final report, call `unwatch_pull_request`.
-   - `wakeOnEvent: false` means the wait ends on a timer, not on a PR event: CI that hasn't registered, or a review bot that may stay silent. The watcher can't wake you for that, so wait with mode 2 if your harness supports it, otherwise mode 3, while the watch stays on.
+   - `wakeOnEvent: false` means the wait may end on a timer, not on a PR event: CI that hasn't registered, a review bot that may stay silent, or a bot check that may never finish. The watcher can't wake you for that, so wait with mode 2 if your harness supports it, otherwise mode 3, while the watch stays on.
 2. **Background commands wake you when they finish** (Claude Code): run `scripts/pr-status.sh --wait N` in the background and end your turn. On `waitResult: still-waiting`, start it again.
 3. **Neither** (e.g. Codex or a plain CLI): run `scripts/pr-status.sh --wait N` in the foreground; it returns within 9 minutes. Repeat on `still-waiting`, at most 6 times in a row. Then stop and report the status, and tell the user to ask again later.
 

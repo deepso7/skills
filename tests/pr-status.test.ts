@@ -607,8 +607,10 @@ describe("review bots on the head commit", () => {
     const state = stateDir();
     run(p, { state });
     const s = run(p, { state, now: T0 + 1500 });
-    expect([s.nextAction, s.wakeOnEvent, s.blockers.human]).toEqual(["wait", true, []]);
+    expect([s.nextAction, s.blockers.human]).toEqual(["wait", []]);
     expect(s.blockers.wait).toContain("greptile-apps is reviewing aaaaaaa (its check is running)");
+    // a PR watcher wakes when it finishes, but not if it hangs, so a timer backs it up
+    expect([run(p, { state, now: T0 + 600 }).wakeOnEvent, s.wakeOnEvent]).toEqual([true, false]);
     const stuck = run(p, { state, now: T0 + 3601 });
     expect([stuck.nextAction, stuck.blockers.wait]).toEqual(["ask-user", []]);
     expect(stuck.blockers.human).toEqual(["1 checks still running after 60m: Greptile Review"]);

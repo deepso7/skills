@@ -411,8 +411,12 @@ status() {
     then .blockers.human += ["blocked by branch protection (required checks, approvals, or signed commits)"] else . end
   | .ready = (.state == "OPEN" and ([.blockers[][]] | length) == 0)
   # a PR watcher (T3 Code) wakes on check results, comments and reviews. It never wakes for a
-  # grace period running out: CI that never registers, or a review bot that stays silent.
-  | .wakeOnEvent = ((.checksPending - $stuckChecks | length) > 0 or (.blockers.wait | any(test("^CI is pending|^GitHub is still computing"))))
+  # grace period running out: CI that never registers, or a review bot that stays silent. Nor
+  # for a bot check that never finishes: without required checks, "all checks passed" waits on
+  # it too, so once its bot is past the grace period a timer has to back the watcher up.
+  | .wakeOnEvent = (((.checksPending - $stuckChecks | length) > 0
+                     and ([$botsBehind[] | select(.waitedSecs >= $botGrace and (.checksRunning | length) > 0)] | length) == 0)
+                    or (.blockers.wait | any(test("^CI is pending|^GitHub is still computing"))))
   # needs a person even though the rest is still running; say so now, keep watching the rest
   | .tellUserNow = [.checksAwaitingApproval[] | "check \(.name) is waiting for someone to approve it"]
   | .nextAction = (if .state != "OPEN" then "stop"
