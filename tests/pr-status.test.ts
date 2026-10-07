@@ -676,8 +676,7 @@ describe("GitHub errors", () => {
 
   test("several agents recovering the same stale lock lose no updates", async () => {
     const state = stateDir();
-    require("fs").mkdirSync(join(state, "o_r-7.json.lock"));
-    writeFileSync(join(state, "o_r-7.json.lock", "pid"), "999999");
+    writeFileSync(join(state, "o_r-7.json.lock"), "999999");
     const dir = mkdtempSync(join(tmpdir(), "prs-"));
     const procs = Array.from({ length: 8 }, () => Bun.spawn(["bash", SCRIPT, "--record", "round", "7"],
       { env: { ...process.env, GH_REPO: "o/r", BABYSIT_STATE_DIR: state, BABYSIT_NOW: String(T0) }, cwd: dir, stdout: "ignore" }));
@@ -685,10 +684,15 @@ describe("GitHub errors", () => {
     expect(run(pr(), { state }).session.rounds).toBe(8);
   });
 
-  test("a lock left by a dead process is taken over", () => {
+  test("a lock directory left by the previous version is cleared after 10s", () => {
     const state = stateDir();
     require("fs").mkdirSync(join(state, "o_r-7.json.lock"));
-    writeFileSync(join(state, "o_r-7.json.lock", "pid"), "999999");
+    expect(run(pr(), { state }).nextAction).toBe("done");
+  }, 20_000);
+
+  test("a lock left by a dead process is taken over", () => {
+    const state = stateDir();
+    writeFileSync(join(state, "o_r-7.json.lock"), "999999");
     expect(run(pr(), { state }).nextAction).toBe("done");
   });
 

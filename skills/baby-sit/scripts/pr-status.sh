@@ -86,13 +86,18 @@ write_state() {  # stdin -> $1, atomically
   local tmp
   tmp="$(mktemp "$STATE_DIR/.tmp.XXXXXX")" && cat > "$tmp" && mv "$tmp" "$1"
 }
+# take_lock <file>: creates it holding our pid, or fails if it exists. bash's noclobber opens it
+# with O_EXCL, which is atomic on every platform. mkdir is not: uutils mkdir (Ubuntu 26.04) lets
+# several racing processes all "create" the same directory. macOS has no flock.
+take_lock() { ( set -C; echo $$ > "$1" ) 2>/dev/null; }
 # break_lock <lock> <stale-owner>: removes a stale lock. Only one process may do it at a time, and
 # only if the lock still has the owner it saw, so a lock someone else just took is never removed.
 break_lock() {
   local lock="$1" seen="$2"
-  if mkdir "$lock.break" 2>/dev/null; then
-    [[ "$(cat "$lock/pid" 2>/dev/null || true)" == "$seen" ]] && rm -rf "$lock"
-    rmdir "$lock.break"
+  if take_lock "$lock.break"; then
+    # -r: a lock directory left by an older version of this script
+    [[ "$(cat "$lock" 2>/dev/null || true)" == "$seen" ]] && rm -rf "$lock"
+    rm -f "$lock.break"
   fi
   return 0
 }
@@ -103,25 +108,23 @@ update_state() {
   if ! mkdir -p "$STATE_DIR" 2>/dev/null || [[ ! -w $STATE_DIR ]]; then
     echo "baby-sit: state dir $STATE_DIR is not writable" >&2; return 1
   fi
-  # mkdir is atomic (macOS has no flock). The lock holds its owner's pid; if that process is gone,
-  # or wrote no pid within 10s, the lock is stale. A live owner holding it for 10s is an error.
-  until mkdir "$lock" 2>/dev/null; do
-    [[ -d $lock ]] || { echo "baby-sit: cannot create $lock" >&2; return 1; }
-    owner="$(cat "$lock/pid" 2>/dev/null || true)"
+  # The lock file holds its owner's pid; if that process is gone, or no pid shows up within 10s,
+  # the lock is stale. A live owner holding it for 20s is an error.
+  until take_lock "$lock"; do
+    owner="$(cat "$lock" 2>/dev/null || true)"
     if [[ -n $owner ]] && ! kill -0 "$owner" 2>/dev/null; then break_lock "$lock" "$owner"
     elif (( tries > 100 )) && [[ -z $owner ]]; then break_lock "$lock" ""
     fi
     if (( ++tries > 100 )); then
       # a breaker that died mid-way leaves $lock.break behind; a live one holds it for milliseconds
-      (( tries == 101 )) && { rmdir "$lock.break" 2>/dev/null || true; }
+      (( tries == 101 )) && rm -f "$lock.break"
       if (( tries > 200 )); then echo "baby-sit: could not take $lock (held by ${owner:-no pid})" >&2; return 1; fi
     fi
     sleep 0.1
   done
-  echo $$ > "$lock/pid"
   next="$(read_state "$f" | jq -c "$@")" || rc=$?
   if (( rc == 0 )); then write_state "$f" <<<"$next" || rc=$?; fi
-  rm -rf "$lock"
+  rm -f "$lock"
   if (( rc == 0 )); then echo "$next"; fi
   return $rc
 }
