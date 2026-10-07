@@ -493,6 +493,16 @@ describe("checks that need a person", () => {
     expect([s.checksFailed, s.nextAction]).toEqual([[], "ask-user"]);
   });
 
+  test("a check re-run on an old head gets its own hour", () => {
+    const running = withChecks({ __typename: "CheckRun", name: "e2e", status: "IN_PROGRESS", conclusion: null, detailsUrl: "" });
+    const finished = withRollup("SUCCESS", { __typename: "CheckRun", name: "e2e", status: "COMPLETED", conclusion: "SUCCESS", detailsUrl: "" });
+    const state = stateDir();
+    run(finished, { state });
+    const rerun = run(running, { state, now: T0 + 7200 });
+    expect([rerun.nextAction, rerun.blockers.wait]).toEqual(["wait", ["1 checks running"]]);
+    expect(run(running, { state, now: T0 + 7200 + 3601 }).nextAction).toBe("ask-user");
+  });
+
   test("a check still running long after the push is reported, not waited on forever", () => {
     const p = withChecks({ __typename: "CheckRun", name: "e2e", status: "IN_PROGRESS", conclusion: null, detailsUrl: "" });
     const state = stateDir();
@@ -529,8 +539,14 @@ describe("review bots on the head commit", () => {
 
   test("a passed bot check on the head counts (CodeRabbit posts 'Review completed' as a status)", () => {
     const p = withCheck(pr({ reviews: { nodes: [review(501, "coderabbitai", "old")] }, comments: { nodes: [handled(501)] } }),
-      { __typename: "StatusContext", context: "CodeRabbit", state: "SUCCESS", targetUrl: "" });
+      { __typename: "StatusContext", context: "CodeRabbit", state: "SUCCESS", targetUrl: "", creator: { login: "coderabbitai" } });
     expect(run(p).nextAction).toBe("done");
+  });
+
+  test("a CI job named after the bot is not the bot's review", () => {
+    const p = withCheck(pr({ reviews: { nodes: [review(501, "coderabbitai", "old")] }, comments: { nodes: [handled(501)] } }),
+      { __typename: "CheckRun", name: "CodeRabbit integration tests", status: "COMPLETED", conclusion: "SUCCESS", detailsUrl: "", checkSuite: { app: { slug: "github-actions" } } });
+    expect(run(p).reviewBots[0].reviewedHead).toBe(false);
   });
 
   test("a bot reply in a thread is not a review of the head (a 'thanks' says nothing about new commits)", () => {
@@ -576,7 +592,7 @@ describe("review bots on the head commit", () => {
   // minip2p#73/#76: cubic showed "skipping" and was read as a pass
   test("a skipped bot check is not a review, and the report says it was skipped", () => {
     const p = withCheck(pr({ reviews: { nodes: [review(501, "cubic-dev-ai", "old")] }, comments: { nodes: [handled(501)] } }),
-      { __typename: "CheckRun", name: "cubic · AI code reviewer", status: "COMPLETED", conclusion: "SKIPPED", detailsUrl: "" });
+      { __typename: "CheckRun", name: "cubic · AI code reviewer", status: "COMPLETED", conclusion: "SKIPPED", detailsUrl: "", checkSuite: { app: { slug: "cubic-dev-ai" } } });
     const state = stateDir();
     run(p, { state });
     const s = run(p, { state, now: T0 + 900 });
@@ -642,6 +658,29 @@ describe("GitHub errors", () => {
     expect(run([FAIL, FAIL, pr()], { env: fast }).nextAction).toBe("done");
   });
 
+  test("failing to find the PR or the repo still prints the error JSON", () => {
+    for (const opts of [{ args: [] as string[] }, { args: ["7"], env: { GH_REPO: "" } }]) {
+      const r = exec([FAIL], { ...opts, env: { ...fast, ...opts.env } });
+      expect([r.exitCode, JSON.parse(r.stdout.toString()).nextAction]).toEqual([1, "error"]);
+    }
+  });
+
+  test("an unwritable state dir fails the check quickly instead of hanging", () => {
+    const file = join(stateDir(), "not-a-dir");
+    writeFileSync(file, "");
+    const started = Date.now();
+    const r = exec(pr(), { state: file, env: fast });
+    expect([r.exitCode, JSON.parse(r.stdout.toString()).nextAction]).toEqual([1, "error"]);
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
+
+  test("a lock left by a dead process is taken over", () => {
+    const state = stateDir();
+    require("fs").mkdirSync(join(state, "o_r-7.json.lock"));
+    writeFileSync(join(state, "o_r-7.json.lock", "pid"), "999999");
+    expect(run(pr(), { state }).nextAction).toBe("done");
+  });
+
   test("three failures give nextAction error and exit 1, with JSON on stdout", () => {
     const r = exec([FAIL], { env: fast });
     expect(r.exitCode).toBe(1);
@@ -650,6 +689,20 @@ describe("GitHub errors", () => {
 });
 
 describe("#12 --wait", () => {
+  test("a new approval notice ends the wait; the next wait does not return for it again", () => {
+    const running = { __typename: "CheckRun", name: "test", status: "IN_PROGRESS", conclusion: null, detailsUrl: "" };
+    const both = pr();
+    (both.commits.nodes[0]!.commit as any).statusCheckRollup = { state: "PENDING", contexts: { nodes: [running,
+      { __typename: "CheckRun", name: "aws-bench", status: "WAITING", conclusion: null, detailsUrl: "" }] } };
+    const onlyTest = pr();
+    (onlyTest.commits.nodes[0]!.commit as any).statusCheckRollup = { state: "PENDING", contexts: { nodes: [running] } };
+    const state = stateDir();
+    const first = run([onlyTest, both], { state, args: ["--wait", "7"], env: { POLL_SECS: "0", WAIT_SECS: "60" } });
+    expect([first.nextAction, first.waitResult, first.newNotices]).toEqual(["wait", "changed", ["check aws-bench is waiting for someone to approve it"]]);
+    const again = run([both], { state, args: ["--wait", "7"], env: { POLL_SECS: "1", WAIT_SECS: "2" } });
+    expect([again.waitResult, again.newNotices, again.tellUserNow.length]).toEqual(["still-waiting", [], 1]);
+  });
+
   const pending = () => {
     const p = pr();
     (p.commits.nodes[0]!.commit as any).statusCheckRollup = { state: "PENDING", contexts: { nodes: [{ __typename: "CheckRun", name: "ci", status: "QUEUED", conclusion: null, detailsUrl: "" }] } };

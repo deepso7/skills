@@ -58,8 +58,17 @@ retry() {
   return 1
 }
 
-PR="${1:-$(retry gh pr view --json number -q .number)}"
-REPO="${GH_REPO:-$(retry gh repo view --json nameWithOwner -q .nameWithOwner)}"
+GH_FAILED='GitHub API calls failed 3 times; check `gh auth status` and try again'
+failed() { jq -n --arg pr "${PR:-}" --arg msg "$1" '{pr:($pr | tonumber? // $pr), nextAction:"error", error:$msg}'; }
+
+PR="${1:-}"
+if [[ -z $PR ]] && ! PR="$(retry gh pr view --json number -q .number)"; then
+  failed "no PR found for the current branch, or $GH_FAILED"; exit 1
+fi
+if [[ -n ${GH_REPO:-} ]]; then REPO="$GH_REPO"
+elif ! REPO="$(retry gh repo view --json nameWithOwner -q .nameWithOwner)"; then
+  failed "could not tell which GitHub repo this is (set GH_REPO=owner/repo), or $GH_FAILED"; exit 1
+fi
 OWNER="${REPO%/*}"; NAME="${REPO#*/}"
 MAX_BODY="${MAX_BODY:-6000}"
 WAIT_SECS="${WAIT_SECS:-540}"
@@ -74,24 +83,33 @@ REPO_STATE="$STATE_DIR/${REPO//\//_}.json"
 now() { echo "${BABYSIT_NOW:-$(date +%s)}"; }
 read_state() { jq -c 'if type == "object" then . else {} end' "$1" 2>/dev/null || echo '{}'; }
 write_state() {  # stdin -> $1, atomically
-  mkdir -p "$STATE_DIR"
-  local tmp; tmp="$(mktemp "$STATE_DIR/.tmp.XXXXXX")"
-  cat > "$tmp" && mv "$tmp" "$1"
+  local tmp
+  tmp="$(mktemp "$STATE_DIR/.tmp.XXXXXX")" && cat > "$tmp" && mv "$tmp" "$1"
 }
 # update_state <file> <jq args...> <filter>: read, transform and write one state file while holding
 # its lock, so concurrent agents and polls don't lose each other's updates. Prints the new state.
 update_state() {
-  local f="$1" tries=0 next rc=0; shift
-  mkdir -p "$STATE_DIR"
-  # mkdir is atomic (macOS has no flock); a lock held for 10s belongs to a killed process
-  until mkdir "$f.lock" 2>/dev/null; do
-    (( ++tries > 100 )) && { rm -rf "$f.lock"; tries=0; }
+  local f="$1" lock="$1.lock" tries=0 owner next rc=0; shift
+  if ! mkdir -p "$STATE_DIR" 2>/dev/null || [[ ! -w $STATE_DIR ]]; then
+    echo "baby-sit: state dir $STATE_DIR is not writable" >&2; return 1
+  fi
+  # mkdir is atomic (macOS has no flock). The lock holds its owner's pid; if that process is gone,
+  # or wrote no pid within 10s, the lock is stale. A live owner holding it for 10s is an error.
+  until mkdir "$lock" 2>/dev/null; do
+    [[ -d $lock ]] || { echo "baby-sit: cannot create $lock" >&2; return 1; }
+    owner="$(cat "$lock/pid" 2>/dev/null || true)"
+    if [[ -n $owner ]] && ! kill -0 "$owner" 2>/dev/null; then rm -rf "$lock"; continue; fi
+    if (( ++tries > 100 )); then
+      [[ -z $owner ]] && { rm -rf "$lock"; tries=0; continue; }
+      echo "baby-sit: $lock is held by process $owner" >&2; return 1
+    fi
     sleep 0.1
   done
+  echo $$ > "$lock/pid"
   next="$(read_state "$f" | jq -c "$@")" || rc=$?
-  (( rc == 0 )) && write_state "$f" <<<"$next"
-  rmdir "$f.lock" 2>/dev/null || true
-  (( rc == 0 )) && echo "$next"
+  if (( rc == 0 )); then write_state "$f" <<<"$next" || rc=$?; fi
+  rm -rf "$lock"
+  if (( rc == 0 )); then echo "$next"; fi
   return $rc
 }
 
@@ -113,8 +131,8 @@ query($owner:String!,$name:String!,$pr:Int!){
       mergeable mergeStateStatus reviewDecision
       commits(last:1){nodes{commit{oid statusCheckRollup{state
         contexts(first:100){totalCount nodes{
-          ... on CheckRun{__typename name status conclusion detailsUrl}
-          ... on StatusContext{__typename context state targetUrl}
+          ... on CheckRun{__typename name status conclusion detailsUrl checkSuite{app{slug}}}
+          ... on StatusContext{__typename context state targetUrl creator{login}}
         }}}}}}
       reviewThreads(first:100){totalCount nodes{id isResolved isOutdated path line originalLine
         comments(first:100){totalCount nodes{databaseId author{login __typename} body createdAt lastEditedAt}}}}
@@ -164,14 +182,22 @@ local_state() {
 }
 
 status() {
-  local raw head t state bots
+  local raw head t state bots pending out new
   raw="$(retry gh api graphql -F owner="$OWNER" -F name="$NAME" -F pr="$PR" -f query="$QUERY")" || return 1
   head="$(jq -er .data.repository.pullRequest.headRefOid <<<"$raw")" || return 1
   t="$(now)"
   # remember when each head commit first showed up; grace periods count from there
-  state="$(update_state "$PR_STATE" --arg h "$head" --argjson now "$t" '.heads[$h] //= $now | .lastHead = $h')" || return 1
+  # names of running checks; same rule as `pending` in the main filter below
+  pending="$(jq -c '[.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]?
+    | select((.__typename == "CheckRun" and .status != "COMPLETED" and .status != "WAITING") or .state == "PENDING" or .state == "EXPECTED")
+    | .name // .context]' <<<"$raw")" || return 1
+  # when each running check was first seen running; a check that finished and was re-run starts over
+  state="$(update_state "$PR_STATE" --arg h "$head" --argjson now "$t" --argjson pending "$pending" '
+    .heads[$h] //= $now | .lastHead = $h
+    | (.pendingSince // {}) as $old
+    | .pendingSince = (reduce $pending[] as $n ({}; .["\($h) \($n)"] = ($old["\($h) \($n)"] // $now)))')" || return 1
   bots="$(repo_bots)" || return 1
-  jq --argjson max "$MAX_BODY" --arg repo "$REPO" --argjson now "$t" --argjson state "$state" \
+  out="$(jq --argjson max "$MAX_BODY" --arg repo "$REPO" --argjson now "$t" --argjson state "$state" \
      --argjson repoBots "$bots" --arg ignoreBots "${BABYSIT_IGNORE_BOTS:-}" \
      --argjson noChecksGrace "$NO_CHECKS_GRACE" --argjson botGrace "$BOT_GRACE" --argjson stuck "$CHECK_STUCK_SECS" \
      --argjson local "$(local_state "$head")" '
@@ -235,6 +261,7 @@ status() {
 
   | ($head.statusCheckRollup.contexts.nodes // [] | map(
       {name:(.name // .context), url:(.detailsUrl // .targetUrl),
+       owner:(.checkSuite.app.slug // .creator.login // null),
        kind:(if ((.detailsUrl // "") | test("/actions/runs/")) then "actions" else "external" end),
        runId:((.detailsUrl // "") | capture("/actions/runs/(?<id>[0-9]+)").id // null),
        # a job held by an environment protection rule, or a run that needs someone to approve it
@@ -257,7 +284,9 @@ status() {
        ([$p.comments.nodes[], $p.reviewThreads.nodes[].comments.nodes[]][]
         | select(.author.__typename == "Bot") | .author.login | select(botKey as $k | $knownReviewers | index($k)))
      ] + $repoBots | unique - $ignored) as $reviewBots
-  | def botCheck($b): ($b | botKey) as $k | if ($k | length) < 4 then [] else [$checks[] | select(.name | ascii_downcase | contains($k))] end;
+  # the check the bot itself posted ("CodeRabbit" status, "cubic · AI code reviewer" run), matched
+  # by the app or account that created it; a CI job named after the bot is not it
+  | def botCheck($b): ($b | botKey) as $k | [$checks[] | select(.owner != null and (.owner | botKey) == $k)];
     def rereviewAt($b): $state.rereview[$p.headRefOid][$b] // 0;
     [ $reviewBots[] as $b
       | (botCheck($b)) as $bc
@@ -318,7 +347,7 @@ status() {
         (if ($head.statusCheckRollup.contexts.totalCount // 0) > 100 then "only the first 100 checks were listed" else empty end)
       ]
     }
-  | ($headAge > $stuck and (.checksPending | length) > 0) as $stuckChecks
+  | [.checksPending[] | select($now - ($state.pendingSince["\($p.headRefOid) \(.)"] // $now) > $stuck)] as $stuckChecks
   | .blockers = {
       agent: [
         (if .local == null then empty
@@ -340,17 +369,15 @@ status() {
         (if .mergeState == "BEHIND" then "branch is behind \(.base) and must be updated" else empty end)
       ],
       wait: [
-        (if $stuckChecks then empty else
-          ((.checksPending | length) as $n | if $n > 0 then "\($n) checks running" else empty end),
-          (if (.checksPending | length) == 0 and (.checksAwaitingApproval | length) == 0 and ($ci == "PENDING" or $ci == "EXPECTED") then "CI is pending" else empty end)
-        end),
+        ((.checksPending - $stuckChecks | length) as $n | if $n > 0 then "\($n) checks running" else empty end),
+        (if (.checksPending | length) == 0 and (.checksAwaitingApproval | length) == 0 and ($ci == "PENDING" or $ci == "EXPECTED") then "CI is pending" else empty end),
         (if $ci == "NONE" and $headAge < $noChecksGrace then "no checks reported on \(.head[0:7]) yet" else empty end),
         ($botsBehind[] | select(.waitedSecs < $botGrace) | "waiting for \(.bot) to review \($p.headRefOid[0:7])"),
         (if .mergeable == "UNKNOWN" or .mergeState == "UNKNOWN" then "GitHub is still computing mergeability" else empty end)
       ],
       human: ([
         (.checksAwaitingApproval[] | "check \(.name) is waiting for someone to approve it"),
-        (if $stuckChecks then "\(.checksPending | length) checks still running after \($headAge | mins): \(.checksPending | join(", "))" else empty end),
+        (if ($stuckChecks | length) > 0 then "\($stuckChecks | length) checks still running after \($stuck | mins): \($stuckChecks | join(", "))" else empty end),
         ($botsBehind[] | select(.waitedSecs >= $botGrace)
          | "\(.bot) has not reviewed \($p.headRefOid[0:7]) after \(.waitedSecs | mins)"
            + (if .skippedHead then " (its check was skipped)" else " (skipped, out of quota, or needs a trigger)" end)),
@@ -365,34 +392,40 @@ status() {
   | .ready = (.state == "OPEN" and ([.blockers[][]] | length) == 0)
   # a PR watcher (T3 Code) wakes on check results, comments and reviews. It never wakes for a
   # grace period running out: CI that never registers, or a review bot that stays silent.
-  | .wakeOnEvent = ((.checksPending | length) > 0 or (.blockers.wait | any(test("^CI is pending|^GitHub is still computing"))))
+  | .wakeOnEvent = ((.checksPending - $stuckChecks | length) > 0 or (.blockers.wait | any(test("^CI is pending|^GitHub is still computing"))))
   # needs a person even though the rest is still running; say so now, keep watching the rest
   | .tellUserNow = [.checksAwaitingApproval[] | "check \(.name) is waiting for someone to approve it"]
   | .nextAction = (if .state != "OPEN" then "stop"
                    elif (.blockers.agent | length) > 0 then "fix"
                    elif (.blockers.wait | length) > 0 then "wait"
                    elif (.blockers.human | length) > 0 then "ask-user"
-                   else "done" end)' <<<"$raw"
+                   else "done" end)' <<<"$raw")" || return 1
+  # notices not reported by an earlier check end a --wait, so the user hears about them now
+  new="$(jq -c --argjson state "$state" '.tellUserNow - ($state.told // [])' <<<"$out")" || return 1
+  if [[ $new != '[]' ]]; then
+    update_state "$PR_STATE" --argjson new "$new" '.told = ((.told // []) + $new | unique)' >/dev/null || return 1
+  fi
+  jq --argjson new "$new" '. + {newNotices:$new}' <<<"$out"
 }
 
-failed() { jq -n --arg pr "$PR" '{pr:($pr | tonumber? // $pr), nextAction:"error", error:"GitHub API calls failed 3 times; check `gh auth status` and try again"}'; }
-
 if [[ $MODE == status ]]; then
-  if out="$(status)"; then echo "$out"; else failed; exit 1; fi
+  if out="$(status)"; then echo "$out"; else failed "$GH_FAILED"; exit 1; fi
   exit
 fi
 
 # --wait: an error is retried like a wait until the time runs out
 start=$SECONDS
 while :; do
-  out="$(status)" || out="$(failed)"
+  out="$(status)" || out="$(failed "$GH_FAILED")"
   next="$(jq -r .nextAction <<<"$out")"
-  [[ $next == wait || $next == error ]] && (( SECONDS - start + POLL_SECS < WAIT_SECS )) || break
+  [[ $next == wait || $next == error ]] && [[ "$(jq -c '.newNotices // []' <<<"$out")" == '[]' ]] &&
+    (( SECONDS - start + POLL_SECS < WAIT_SECS )) || break
   sleep "$POLL_SECS"
 done
-case "$next" in
-  wait|error) result=still-waiting ;;
-  *) result=changed ;;
-esac
+if [[ $next == wait || $next == error ]] && [[ "$(jq -c '.newNotices // []' <<<"$out")" == '[]' ]]; then
+  result=still-waiting
+else
+  result=changed
+fi
 jq --arg r "$result" --argjson s $((SECONDS - start)) '. + {waitResult:$r, waitedSecs:$s}' <<<"$out"
 [[ $next != error ]]
