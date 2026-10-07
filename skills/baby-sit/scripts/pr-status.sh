@@ -86,6 +86,16 @@ write_state() {  # stdin -> $1, atomically
   local tmp
   tmp="$(mktemp "$STATE_DIR/.tmp.XXXXXX")" && cat > "$tmp" && mv "$tmp" "$1"
 }
+# break_lock <lock> <stale-owner>: removes a stale lock. Only one process may do it at a time, and
+# only if the lock still has the owner it saw, so a lock someone else just took is never removed.
+break_lock() {
+  local lock="$1" seen="$2"
+  if mkdir "$lock.break" 2>/dev/null; then
+    [[ "$(cat "$lock/pid" 2>/dev/null || true)" == "$seen" ]] && rm -rf "$lock"
+    rmdir "$lock.break"
+  fi
+  return 0
+}
 # update_state <file> <jq args...> <filter>: read, transform and write one state file while holding
 # its lock, so concurrent agents and polls don't lose each other's updates. Prints the new state.
 update_state() {
@@ -98,10 +108,13 @@ update_state() {
   until mkdir "$lock" 2>/dev/null; do
     [[ -d $lock ]] || { echo "baby-sit: cannot create $lock" >&2; return 1; }
     owner="$(cat "$lock/pid" 2>/dev/null || true)"
-    if [[ -n $owner ]] && ! kill -0 "$owner" 2>/dev/null; then rm -rf "$lock"; continue; fi
+    if [[ -n $owner ]] && ! kill -0 "$owner" 2>/dev/null; then break_lock "$lock" "$owner"
+    elif (( tries > 100 )) && [[ -z $owner ]]; then break_lock "$lock" ""
+    fi
     if (( ++tries > 100 )); then
-      [[ -z $owner ]] && { rm -rf "$lock"; tries=0; continue; }
-      echo "baby-sit: $lock is held by process $owner" >&2; return 1
+      # a breaker that died mid-way leaves $lock.break behind; a live one holds it for milliseconds
+      (( tries == 101 )) && { rmdir "$lock.break" 2>/dev/null || true; }
+      if (( tries > 200 )); then echo "baby-sit: could not take $lock (held by ${owner:-no pid})" >&2; return 1; fi
     fi
     sleep 0.1
   done
@@ -400,10 +413,14 @@ status() {
                    elif (.blockers.wait | length) > 0 then "wait"
                    elif (.blockers.human | length) > 0 then "ask-user"
                    else "done" end)' <<<"$raw")" || return 1
-  # notices not reported by an earlier check end a --wait, so the user hears about them now
-  new="$(jq -c --argjson state "$state" '.tellUserNow - ($state.told // [])' <<<"$out")" || return 1
-  if [[ $new != '[]' ]]; then
-    update_state "$PR_STATE" --argjson new "$new" '.told = ((.told // []) + $new | unique)' >/dev/null || return 1
+  # notices not reported by an earlier check of this head end a --wait, so the user hears about
+  # them now. Only the current notices are remembered: one that clears and comes back is new again.
+  local told notices
+  told="$(jq -c --arg h "$head" 'if .told.head == $h then .told.notices else [] end' <<<"$state")" || return 1
+  notices="$(jq -c '.tellUserNow' <<<"$out")" || return 1
+  new="$(jq -nc --argjson n "$notices" --argjson t "$told" '$n - $t')" || return 1
+  if [[ $notices != "$told" ]]; then
+    update_state "$PR_STATE" --arg h "$head" --argjson n "$notices" '.told = {head:$h, notices:$n}' >/dev/null || return 1
   fi
   jq --argjson new "$new" '. + {newNotices:$new}' <<<"$out"
 }

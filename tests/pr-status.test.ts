@@ -674,6 +674,17 @@ describe("GitHub errors", () => {
     expect(Date.now() - started).toBeLessThan(5000);
   });
 
+  test("several agents recovering the same stale lock lose no updates", async () => {
+    const state = stateDir();
+    require("fs").mkdirSync(join(state, "o_r-7.json.lock"));
+    writeFileSync(join(state, "o_r-7.json.lock", "pid"), "999999");
+    const dir = mkdtempSync(join(tmpdir(), "prs-"));
+    const procs = Array.from({ length: 8 }, () => Bun.spawn(["bash", SCRIPT, "--record", "round", "7"],
+      { env: { ...process.env, GH_REPO: "o/r", BABYSIT_STATE_DIR: state, BABYSIT_NOW: String(T0) }, cwd: dir, stdout: "ignore" }));
+    await Promise.all(procs.map((p) => p.exited));
+    expect(run(pr(), { state }).session.rounds).toBe(8);
+  });
+
   test("a lock left by a dead process is taken over", () => {
     const state = stateDir();
     require("fs").mkdirSync(join(state, "o_r-7.json.lock"));
@@ -701,6 +712,9 @@ describe("#12 --wait", () => {
     expect([first.nextAction, first.waitResult, first.newNotices]).toEqual(["wait", "changed", ["check aws-bench is waiting for someone to approve it"]]);
     const again = run([both], { state, args: ["--wait", "7"], env: { POLL_SECS: "1", WAIT_SECS: "2" } });
     expect([again.waitResult, again.newNotices, again.tellUserNow.length]).toEqual(["still-waiting", [], 1]);
+    // approved, then needed again (a re-run): that is news again
+    run(onlyTest, { state });
+    expect(run(both, { state }).newNotices).toEqual(["check aws-bench is waiting for someone to approve it"]);
   });
 
   const pending = () => {
