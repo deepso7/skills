@@ -34,12 +34,14 @@ Run `scripts/pr-status.sh N` and act on `nextAction`:
 
 Use the first mode your environment supports, and say which one you're using in your first progress line.
 
-1. **A PR watch tool exists** (T3 Code's `watch_pull_request`): call it once, then end your turn. It wakes you when checks finish, someone comments or reviews, or the branch conflicts. On each wake, run one check and act on it; if it says `wait`, end your turn again. Before the final report, call `unwatch_pull_request`.
-   - The watcher does not wake you when a review bot stays silent. If `blockers.wait` lists only "waiting for <bot> to review", and your harness can wake you from a background command, also run `pr-status.sh --wait N` in the background (mode 2).
+1. **A PR watch tool exists** (T3 Code's `watch_pull_request`): call it once. On a `wait` with `wakeOnEvent: true`, end your turn; the watcher wakes you when checks finish, someone comments or reviews, or the branch conflicts. On each wake, run one check and act on it. Before the final report, call `unwatch_pull_request`.
+   - `wakeOnEvent: false` means the wait ends on a timer, not on a PR event: CI that hasn't registered, or a review bot that may stay silent. The watcher can't wake you for that, so wait with mode 2 if your harness supports it, otherwise mode 3, while the watch stays on.
 2. **Background commands wake you when they finish** (Claude Code): run `scripts/pr-status.sh --wait N` in the background and end your turn. On `waitResult: still-waiting`, start it again.
 3. **Neither** (e.g. Codex or a plain CLI): run `scripts/pr-status.sh --wait N` in the foreground; it returns within 9 minutes. Repeat on `still-waiting`, at most 6 times in a row. Then stop and report the status, and tell the user to ask again later.
 
 Never end a turn while saying you are babysitting unless mode 1 or 2 will wake you. Don't write your own `sleep` / `gh pr checks --watch` loops; `--wait` already polls cheaply and returns on anything new.
+
+In every mode, if `tellUserNow` is not empty (e.g. a deployment waiting for approval), tell the user in one line right away and keep going with the rest.
 
 ## Handling blockers
 

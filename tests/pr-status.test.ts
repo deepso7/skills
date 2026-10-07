@@ -40,7 +40,20 @@ const history = (...prs: Author[][]) => ({ data: { repository: { pullRequests: {
 // fixtures: one response, or a list served in order (last one repeats)
 // a fixture that makes that gh call fail
 const FAIL = {};
-type RunOpts = { args?: string[]; env?: Record<string, string>; cwd?: string; history?: object; state?: string; now?: number };
+type RunOpts = { args?: string[]; env?: Record<string, string>; cwd?: string; history?: object; state?: string; now?: number;
+                 // on GitHub a bot's inline comments always come with a review; by default every bot that
+                 // commented gets an empty review of the head commit, so it counts as a current reviewer
+                 rawBots?: boolean };
+
+function withBotReviews(p: any) {
+  if (p === FAIL || !p.reviewThreads) return p;
+  const commenters = [...p.reviewThreads.nodes.flatMap((t: any) => t.comments.nodes), ...p.comments.nodes]
+    .map((c: any) => c.author).filter((a: Author) => a.__typename === "Bot");
+  const reviewed = new Set(p.reviews.nodes.filter((r: any) => r.commit?.oid === p.headRefOid).map((r: any) => r.author.login));
+  const extra = [...new Map(commenters.map((a: Author) => [a.login, a])).values()].filter((a) => !reviewed.has(a.login))
+    .map((author, i) => ({ databaseId: 80000 + i, author, state: "COMMENTED", body: "", submittedAt: "2026-01-01T00:00:00Z", commit: { oid: p.headRefOid } }));
+  return { ...p, reviews: { ...p.reviews, nodes: [...p.reviews.nodes, ...extra] } };
+}
 // seconds since epoch for the fixture clock; heads are first seen at whatever `now` the first run uses
 const T0 = Date.parse("2026-01-10T00:00:00Z") / 1000;
 const stateDir = () => mkdtempSync(join(tmpdir(), "prs-state-"));
@@ -53,11 +66,12 @@ function run(fixtures: object | object[], opts: RunOpts = {}) {
 
 function exec(fixtures: object | object[], opts: RunOpts = {}) {
   const dir = mkdtempSync(join(tmpdir(), "prs-"));
-  const list = (Array.isArray(fixtures) ? fixtures : [fixtures]).map((p) => p === FAIL ? FAIL : ({ data: { viewer: { login: ME }, repository: { pullRequest: p } } }));
+  const list = (Array.isArray(fixtures) ? fixtures : [fixtures])
+    .map((p) => p === FAIL ? FAIL : ({ data: { viewer: { login: ME }, repository: { pullRequest: opts.rawBots ? p : withBotReviews(p) } } }));
   list.forEach((f, i) => writeFileSync(join(dir, `f${i}.json`), f === FAIL ? "FAIL\n" : JSON.stringify(f)));
-  writeFileSync(join(dir, "history.json"), JSON.stringify(opts.history ?? history()));
+  writeFileSync(join(dir, "history.json"), opts.history === FAIL ? "FAIL\n" : JSON.stringify(opts.history ?? history()));
   writeFileSync(join(dir, "gh"), `#!/bin/sh
-case "$*" in *recentBotCheck*) cat "${dir}/history.json"; exit;; esac
+case "$*" in *recentBotCheck*) [ "$(cat "${dir}/history.json")" = FAIL ] && { echo "HTTP 502" >&2; exit 1; }; cat "${dir}/history.json"; exit;; esac
 n=$(cat "${dir}/count" 2>/dev/null || echo 0); echo $((n+1)) > "${dir}/count"
 i=$n; [ $i -ge ${list.length} ] && i=${list.length - 1}
 if [ "$(cat "${dir}/f$i.json")" = FAIL ]; then echo "HTTP 502" >&2; exit 1; fi
@@ -310,11 +324,13 @@ describe("top-level comments and reviews", () => {
   });
 
   // minip2p#273: CodeRabbit and Greptile rewrite their summary comment on every push
-  test("a bot refreshing a handled summary comment or review is not new work", () => {
-    const summary = { ...cm(91, bot("greptile-apps"), "Confidence 5/5 (updated)", 1), lastEditedAt: "2026-01-09T00:00:00Z" };
+  test("a bot refreshing a handled summary or review is shown for reading but is not new work", () => {
+    const summary = { ...cm(91, bot("greptile-apps"), "Confidence 3/5: new finding in retry.ts", 1), lastEditedAt: "2026-01-09T00:00:00Z" };
     const review = { databaseId: 500, author: bot("coderabbitai"), state: "COMMENTED", body: "Actionable comments posted: 0 (edited)", submittedAt: "2026-01-02T00:00:00Z", lastEditedAt: "2026-01-09T00:00:00Z", commit: { oid: HEAD } };
     const s = run(pr({ reviews: { nodes: [review] }, comments: { nodes: [summary, cm(92, user(ME), "ok\n<!-- baby-sit handled:91,500 -->", 3)] } }));
-    expect([s.botComments, s.newReviews, s.nextAction]).toEqual([[], [], "done"]);
+    expect([s.newReviews, s.nextAction]).toEqual([[], "done"]);
+    expect(s.botComments.map((c: any) => [c.id, c.editedSinceHandled])).toEqual([[91, true], [500, true]]);
+    expect(s.summaryMarker).toBe("<!-- baby-sit handled:91,500 -->");
   });
 
   test("r2#5 a long reply keeps its marker; long feedback is flagged truncated", () => {
@@ -466,6 +482,12 @@ describe("checks that need a person", () => {
     expect(s.blockers.human).toContain("check aws-bench is waiting for someone to approve it");
   });
 
+  test("an approval-held job is reported at once while other checks keep running", () => {
+    const s = run(withChecks({ __typename: "CheckRun", name: "aws-bench", status: "WAITING", conclusion: null, detailsUrl: "u" },
+                             { __typename: "CheckRun", name: "test", status: "IN_PROGRESS", conclusion: null, detailsUrl: "" }));
+    expect([s.nextAction, s.tellUserNow]).toEqual(["wait", ["check aws-bench is waiting for someone to approve it"]]);
+  });
+
   test("action_required is a question for the user, not a failure to fix", () => {
     const s = run(withRollup("FAILURE", { __typename: "CheckRun", name: "deploy", status: "COMPLETED", conclusion: "ACTION_REQUIRED", detailsUrl: "u" }));
     expect([s.checksFailed, s.nextAction]).toEqual([[], "ask-user"]);
@@ -511,10 +533,44 @@ describe("review bots on the head commit", () => {
     expect(run(p).nextAction).toBe("done");
   });
 
-  test("a bot comment in a review thread after the head appeared counts", () => {
+  test("a bot reply in a thread is not a review of the head (a 'thanks' says nothing about new commits)", () => {
     const p = pr({ reviews: { nodes: [review(501, "greptile-apps", "old")] }, comments: { nodes: [handled(501)] },
-      reviewThreads: { totalCount: 1, nodes: [thread("G", true, [cm(7, bot("greptile-apps"), "nit", 11)])] } });
-    expect(run(p).reviewBots[0].reviewedHead).toBe(true);
+      reviewThreads: { totalCount: 1, nodes: [thread("G", true, [cm(7, bot("greptile-apps"), "thanks!", 11)])] } });
+    expect(run(p, { rawBots: true }).reviewBots[0].reviewedHead).toBe(false);
+  });
+
+  test("a pending (unsubmitted) review of the head does not count", () => {
+    const p = pr({ reviews: { nodes: [{ ...review(501, "cubic-dev-ai", HEAD), state: "PENDING" }] } });
+    expect(run(p, { rawBots: true }).reviewBots[0].reviewedHead).toBe(false);
+  });
+
+  test("a known AI reviewer that has only posted 'review in progress' is expected", () => {
+    const s = run(pr({ comments: { nodes: [cm(95, bot("coderabbitai"), "Currently processing new changes", 11)] } }), { rawBots: true });
+    expect(s.blockers.wait).toEqual(["waiting for coderabbitai to review aaaaaaa"]);
+  });
+
+  test("other commenting bots (previews, deploys) are not reviewers", () => {
+    const s = run(pr({ comments: { nodes: [cm(95, bot("vercel"), "Preview ready", 11)] } }), { rawBots: true });
+    expect([s.reviewBots, s.nextAction]).toEqual([[], "done"]);
+  });
+
+  test("if the repo's bot history can't be read, an older cached list is used", () => {
+    const state = stateDir();
+    run(pr(), { state, history: history([bot("cubic-dev-ai")]) });
+    const s = run(pr(), { state, now: T0 + 2 * 86400, history: FAIL, env: { RETRY_DELAY: "0" } });
+    expect(s.reviewBots.map((b: any) => b.bot)).toEqual(["cubic-dev-ai"]);
+  });
+
+  test("if the repo's bot history can't be read and nothing is cached, the check fails instead of assuming no bots", () => {
+    const r = exec(pr(), { history: FAIL, env: { RETRY_DELAY: "0" } });
+    expect([r.exitCode, JSON.parse(r.stdout.toString()).nextAction]).toEqual([1, "error"]);
+  });
+
+  test("wakeOnEvent: a PR watcher wakes for running checks, not for a silent bot", () => {
+    const running = pr({ reviews: { nodes: [review(501, "cubic-dev-ai", "old")] }, comments: { nodes: [handled(501)] } });
+    expect(run(running).wakeOnEvent).toBe(false);
+    (running.commits.nodes[0]!.commit as any).statusCheckRollup = { state: "PENDING", contexts: { nodes: [{ __typename: "CheckRun", name: "ci", status: "IN_PROGRESS", conclusion: null, detailsUrl: "" }] } };
+    expect(run(running).wakeOnEvent).toBe(true);
   });
 
   // minip2p#73/#76: cubic showed "skipping" and was read as a pass
@@ -554,6 +610,15 @@ describe("review bots on the head commit", () => {
 });
 
 describe("--record", () => {
+  test("concurrent records from several agents are all kept", async () => {
+    const state = stateDir();
+    const dir = mkdtempSync(join(tmpdir(), "prs-"));
+    const procs = Array.from({ length: 8 }, () => Bun.spawn(["bash", SCRIPT, "--record", "round", "7"],
+      { env: { ...process.env, GH_REPO: "o/r", BABYSIT_STATE_DIR: state, BABYSIT_NOW: String(T0) }, cwd: dir, stdout: "ignore" }));
+    await Promise.all(procs.map((p) => p.exited));
+    expect(run(pr(), { state }).session.rounds).toBe(8);
+  });
+
   test("rounds and reopened threads are remembered and reported", () => {
     const state = stateDir();
     run([], { state, args: ["--record", "round", "7"] });

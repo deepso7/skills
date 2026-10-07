@@ -11,10 +11,13 @@
 #   - no checks on a head first seen under NO_CHECKS_GRACE (default 150s) ago is a wait, since
 #     CI may not have registered yet; after that a repo without CI is fine.
 #   - review bots are the bots that reviewed this PR or one of the repo's last 10 merged PRs
-#     (cached for a day; BABYSIT_IGNORE_BOTS=login,login skips some). A bot is current when it
-#     reviewed the head commit, commented in a thread since the head appeared, or its check run
-#     passed on the head. A bot that is not current is a wait for BOT_GRACE (default 900s) after
-#     the head appeared or a re-review was recorded, then a question for the user.
+#     (cached for a day), plus known AI reviewers (CodeRabbit, Greptile, cubic, Copilot, ...) that
+#     posted anything on this PR. BABYSIT_IGNORE_BOTS=login,login skips some. A bot is current when
+#     it submitted a review of the head commit or its own check passed on the head. A bot that is
+#     not current is a wait for BOT_GRACE (default 900s) after the head appeared or a re-review was
+#     recorded, then a question for the user.
+#   - wakeOnEvent says whether the wait ends on a PR event (checks finishing) that a PR watcher
+#     would report, or only on a timer. tellUserNow lists things a person must do right away.
 #   - checks waiting for a manual approval, or running over CHECK_STUCK_SECS (default 3600s),
 #     are questions for the user.
 #
@@ -75,15 +78,29 @@ write_state() {  # stdin -> $1, atomically
   local tmp; tmp="$(mktemp "$STATE_DIR/.tmp.XXXXXX")"
   cat > "$tmp" && mv "$tmp" "$1"
 }
+# update_state <file> <jq args...> <filter>: read, transform and write one state file while holding
+# its lock, so concurrent agents and polls don't lose each other's updates. Prints the new state.
+update_state() {
+  local f="$1" tries=0 next rc=0; shift
+  mkdir -p "$STATE_DIR"
+  # mkdir is atomic (macOS has no flock); a lock held for 10s belongs to a killed process
+  until mkdir "$f.lock" 2>/dev/null; do
+    (( ++tries > 100 )) && { rm -rf "$f.lock"; tries=0; }
+    sleep 0.1
+  done
+  next="$(read_state "$f" | jq -c "$@")" || rc=$?
+  (( rc == 0 )) && write_state "$f" <<<"$next"
+  rmdir "$f.lock" 2>/dev/null || true
+  (( rc == 0 )) && echo "$next"
+  return $rc
+}
 
 if [[ $MODE == record ]]; then
-  next="$(read_state "$PR_STATE" | jq --arg e "$EVENT" --arg v "$VALUE" --argjson now "$(now)" '
+  update_state "$PR_STATE" --arg e "$EVENT" --arg v "$VALUE" --argjson now "$(now)" '
     if $e == "round" then .rounds = ((.rounds // 0) + 1)
     elif $e == "reopen" then .reopened = ((.reopened // []) + [$v] | unique)
     elif .lastHead == null then error("run pr-status.sh once before recording a re-review")
-    else .rereview[.lastHead][$v] = $now end')"
-  write_state "$PR_STATE" <<<"$next"
-  echo "$next"
+    else .rereview[.lastHead][$v] = $now end'
   exit
 fi
 
@@ -105,7 +122,8 @@ query($owner:String!,$name:String!,$pr:Int!){
       comments(last:100){totalCount nodes{databaseId author{login __typename} body createdAt lastEditedAt}}
     }}}'
 
-# logins of bots that reviewed one of the repo's last 10 merged PRs, cached for a day
+# logins of bots that reviewed one of the repo's last 10 merged PRs, cached for a day.
+# If GitHub fails, an older cached list is used; with none, the check fails rather than assume no bots.
 repo_bots() {
   local cached out
   cached="$(read_state "$REPO_STATE" | jq -c --argjson now "$(now)" 'select(.botsAt != null and $now - .botsAt < 86400) | .bots')"
@@ -115,10 +133,10 @@ repo_bots() {
         repository(owner:$owner,name:$name){
           pullRequests(last:10, states:MERGED){nodes{reviews(first:50){nodes{author{login __typename}}}}}}}' 2>/dev/null)" &&
      out="$(jq -c '[.data.repository.pullRequests.nodes[].reviews.nodes[].author | select(.__typename == "Bot") | .login] | unique' <<<"$out")"; then
-    read_state "$REPO_STATE" | jq --argjson b "$out" --argjson now "$(now)" '.bots = $b | .botsAt = $now' | write_state "$REPO_STATE"
+    update_state "$REPO_STATE" --argjson b "$out" --argjson now "$(now)" '.bots = $b | .botsAt = $now' >/dev/null
     echo "$out"
   else
-    echo '[]'  # not cached, so the next call tries again
+    read_state "$REPO_STATE" | jq -ce '.bots // empty'
   fi
 }
 
@@ -151,9 +169,8 @@ status() {
   head="$(jq -er .data.repository.pullRequest.headRefOid <<<"$raw")" || return 1
   t="$(now)"
   # remember when each head commit first showed up; grace periods count from there
-  state="$(read_state "$PR_STATE" | jq -c --arg h "$head" --argjson now "$t" '.heads[$h] //= $now | .lastHead = $h')"
-  write_state "$PR_STATE" <<<"$state"
-  bots="$(repo_bots)"
+  state="$(update_state "$PR_STATE" --arg h "$head" --argjson now "$t" '.heads[$h] //= $now | .lastHead = $h')" || return 1
+  bots="$(repo_bots)" || return 1
   jq --argjson max "$MAX_BODY" --arg repo "$REPO" --argjson now "$t" --argjson state "$state" \
      --argjson repoBots "$bots" --arg ignoreBots "${BABYSIT_IGNORE_BOTS:-}" \
      --argjson noChecksGrace "$NO_CHECKS_GRACE" --argjson botGrace "$BOT_GRACE" --argjson stuck "$CHECK_STUCK_SECS" \
@@ -163,7 +180,6 @@ status() {
   | $p.commits.nodes[0].commit as $head
   | ($state.heads[$p.headRefOid]) as $headSince
   | ($now - $headSince) as $headAge
-  | ($headSince | todate) as $headSinceIso
   | "<!-- baby-sit(?: handled:(?<ids>[0-9,]+))? -->\\s*$" as $re
   | def mine: ((.author.login // "") == $viewer) and ((.body // "") | test($re));
     def marker: (.body | capture($re));
@@ -181,7 +197,8 @@ status() {
   | def unhandled: (.mine | not) and ((.id | tostring) as $k | ($handledAt[$k] == null) or (.edited > $handledAt[$k]));
     def editedAfterHandled: (.id | tostring) as $k | $handledAt[$k] != null and .edited > $handledAt[$k];
     # bots rewrite summaries and answered comments ("✅ addressed", a refreshed walkthrough) all the
-    # time; outside open review threads, a bot edit to something already handled is never new work
+    # time; outside open review threads, a bot edit to something already handled is shown in
+    # botComments for reading, but is not new work
     def newToUs: unhandled and ((.bot and editedAfterHandled) | not);
     # when baby-sit first posted on this PR; resolved-thread activity before it is history
     ([$oursRaw[].createdAt] | min) as $since
@@ -229,19 +246,26 @@ status() {
                or .state == "FAILURE" or .state == "ERROR")})) as $checks
   | ($head.statusCheckRollup.state // "NONE") as $ci
 
-  # review bots: bots that reviewed this PR or recent merged PRs
-  | ($ignoreBots | split(",") | map(select(length > 0))) as $ignored
-  | ([$p.reviews.nodes[] | select(.author.__typename == "Bot") | .author.login] + $repoBots | unique - $ignored) as $reviewBots
   # "coderabbitai" -> "coderabbit", "cubic-dev-ai" -> "cubic", "greptile-apps" -> "greptile"; matches check names
   | def botKey: ascii_downcase | sub("\\[bot\\]$"; "") | split("-")[0] | sub("ai$"; "");
-    def botCheck($b): ($b | botKey) as $k | if ($k | length) < 4 then [] else [$checks[] | select(.name | ascii_downcase | contains($k))] end;
+  # review bots: bots that reviewed this PR or recent merged PRs, plus known AI reviewers that
+  # posted anything on this PR (their first act is often a "review in progress" comment).
+  # Other commenting bots (previews, deploys) are not reviewers.
+    ["coderabbit","greptile","cubic","copilot","sourcery","ellipsis","qodo","gemini","codeant","cursor","bugbot","graphite","korbit"] as $knownReviewers
+  | ($ignoreBots | split(",") | map(select(length > 0))) as $ignored
+  | ([ ($p.reviews.nodes[] | select(.author.__typename == "Bot") | .author.login),
+       ([$p.comments.nodes[], $p.reviewThreads.nodes[].comments.nodes[]][]
+        | select(.author.__typename == "Bot") | .author.login | select(botKey as $k | $knownReviewers | index($k)))
+     ] + $repoBots | unique - $ignored) as $reviewBots
+  | def botCheck($b): ($b | botKey) as $k | if ($k | length) < 4 then [] else [$checks[] | select(.name | ascii_downcase | contains($k))] end;
     def rereviewAt($b): $state.rereview[$p.headRefOid][$b] // 0;
     [ $reviewBots[] as $b
       | (botCheck($b)) as $bc
+      # a submitted review of the head commit, or the bot check passing on it. Replies and
+      # comments do not count: a "thanks" on an old thread says nothing about the new commit.
       | {bot:$b,
          reviewedHead:(
-           any($p.reviews.nodes[]; .author.login == $b and .commit.oid == $p.headRefOid)
-           or any($p.reviewThreads.nodes[].comments.nodes[]; .author.login == $b and .createdAt > $headSinceIso)
+           any($p.reviews.nodes[]; .author.login == $b and .commit.oid == $p.headRefOid and .state != "PENDING")
            or any($bc[]; .passed)),
          skippedHead:any($bc[]; .skipped),
          rereviewRequested:(rereviewAt($b) > 0),
@@ -250,11 +274,14 @@ status() {
 
   | [ $p.reviews.nodes[] | select(.state != "PENDING")
       | select((.body // "") != "" or .state == "CHANGES_REQUESTED")
-      | (c + {state, onHead:(.commit.oid == $head.oid)}) | select(newToUs) ] as $newReviews
-  | [ $p.comments.nodes[] | c | select(newToUs) ] as $topLevel
+      | (c + {state, onHead:(.commit.oid == $head.oid)}) | select(unhandled) ] as $reviews
+  | [ $reviews[] | select(newToUs) ] as $newReviews
+  | [ $p.comments.nodes[] | c | select(unhandled) ] as $topLevel
   | [ $topLevel[] | select(.bot | not) ] as $newComments
-  # walkthroughs, "review in progress", previews, rate-limit notes: read, never blocking
-  | [ $topLevel[] | select(.bot) ] as $botComments
+  # walkthroughs, "review in progress", previews, rate-limit notes, and bot edits to summaries
+  # and reviews already handled: read each, never blocking
+  | [ ($topLevel[] | select(.bot)), ($reviews[] | select(newToUs | not))
+      | . + {editedSinceHandled:editedAfterHandled} ] as $botComments
 
   | {
       pr: $p.number, url: $p.url, state: $p.state, draft: $p.isDraft,
@@ -336,6 +363,11 @@ status() {
   | if .mergeState == "BLOCKED" and ([.blockers[][]] | length) == 0
     then .blockers.human += ["blocked by branch protection (required checks, approvals, or signed commits)"] else . end
   | .ready = (.state == "OPEN" and ([.blockers[][]] | length) == 0)
+  # a PR watcher (T3 Code) wakes on check results, comments and reviews. It never wakes for a
+  # grace period running out: CI that never registers, or a review bot that stays silent.
+  | .wakeOnEvent = ((.checksPending | length) > 0 or (.blockers.wait | any(test("^CI is pending|^GitHub is still computing"))))
+  # needs a person even though the rest is still running; say so now, keep watching the rest
+  | .tellUserNow = [.checksAwaitingApproval[] | "check \(.name) is waiting for someone to approve it"]
   | .nextAction = (if .state != "OPEN" then "stop"
                    elif (.blockers.agent | length) > 0 then "fix"
                    elif (.blockers.wait | length) > 0 then "wait"
