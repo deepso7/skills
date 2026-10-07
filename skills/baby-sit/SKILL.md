@@ -22,7 +22,7 @@ Run `scripts/pr-status.sh N` and act on `nextAction`:
 | `nextAction` | Do |
 |---|---|
 | `fix` | Handle every item in `blockers.agent` (below), push, reply, `--record round`, then wait |
-| `wait` | Wait (see **Waiting**). `blockers.wait` says for what |
+| `wait` | Wait (see **Waiting**). `blockers.wait` says for what. Keep waiting even if `blockers.human` has items; report them when `nextAction` changes, not before |
 | `ask-user` | Read `botComments` and `botRepliesOnResolved` first; if you reopened a thread, check again. Otherwise stop and report `blockers.human` |
 | `done` | Same reads as `ask-user`, then the final report |
 | `stop` | PR merged or closed; report |

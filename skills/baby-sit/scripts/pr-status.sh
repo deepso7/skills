@@ -14,8 +14,9 @@
 #     (cached for a day), plus known AI reviewers (CodeRabbit, Greptile, cubic, Copilot, ...) that
 #     posted anything on this PR. BABYSIT_IGNORE_BOTS=login,login skips some. A bot is current when
 #     it submitted a review of the head commit or its own check passed on the head. A bot that is
-#     not current is a wait for BOT_GRACE (default 900s) after the head appeared or a re-review was
-#     recorded, then a question for the user.
+#     not current is a wait while its own check runs on the head (up to CHECK_STUCK_SECS), otherwise
+#     for BOT_GRACE (default 900s) after the head appeared or a re-review was recorded; then it is a
+#     question for the user.
 #   - wakeOnEvent says whether the wait ends on a PR event (checks finishing) that a PR watcher
 #     would report, or only on a timer. tellUserNow lists things a person must do right away.
 #   - checks waiting for a manual approval, or running over CHECK_STUCK_SECS (default 3600s),
@@ -313,6 +314,8 @@ status() {
            any($p.reviews.nodes[]; .author.login == $b and .commit.oid == $p.headRefOid and .state != "PENDING")
            or any($bc[]; .passed)),
          skippedHead:any($bc[]; .skipped),
+         # its own check still running on the head: it is reviewing now, however long that takes
+         checksRunning:[$bc[] | select(.pending) | .name],
          rereviewRequested:(rereviewAt($b) > 0),
          waitedSecs:($now - ([$headSince, rereviewAt($b)] | max))} ] as $bots
   | [ $bots[] | select(.reviewedHead | not) ] as $botsBehind
@@ -388,13 +391,14 @@ status() {
         ((.checksPending - $stuckChecks | length) as $n | if $n > 0 then "\($n) checks running" else empty end),
         (if (.checksPending | length) == 0 and (.checksAwaitingApproval | length) == 0 and ($ci == "PENDING" or $ci == "EXPECTED") then "CI is pending" else empty end),
         (if $ci == "NONE" and $headAge < $noChecksGrace then "no checks reported on \(.head[0:7]) yet" else empty end),
-        ($botsBehind[] | select(.waitedSecs < $botGrace) | "waiting for \(.bot) to review \($p.headRefOid[0:7])"),
+        ($botsBehind[] | select((.checksRunning - $stuckChecks | length) > 0) | "\(.bot) is reviewing \($p.headRefOid[0:7]) (its check is running)"),
+        ($botsBehind[] | select(.waitedSecs < $botGrace and (.checksRunning | length) == 0) | "waiting for \(.bot) to review \($p.headRefOid[0:7])"),
         (if .mergeable == "UNKNOWN" or .mergeState == "UNKNOWN" then "GitHub is still computing mergeability" else empty end)
       ],
       human: ([
         (.checksAwaitingApproval[] | "check \(.name) is waiting for someone to approve it"),
         (if ($stuckChecks | length) > 0 then "\($stuckChecks | length) checks still running after \($stuck | mins): \($stuckChecks | join(", "))" else empty end),
-        ($botsBehind[] | select(.waitedSecs >= $botGrace)
+        ($botsBehind[] | select(.waitedSecs >= $botGrace and (.checksRunning | length) == 0)
          | "\(.bot) has not reviewed \($p.headRefOid[0:7]) after \(.waitedSecs | mins)"
            + (if .skippedHead then " (its check was skipped)" else " (skipped, out of quota, or needs a trigger)" end)),
         (if .reviewDecision == "REVIEW_REQUIRED" then "awaiting required approval" else empty end),

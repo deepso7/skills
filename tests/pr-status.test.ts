@@ -526,7 +526,7 @@ describe("review bots on the head commit", () => {
     const s = run(p, { state });
     expect(s.nextAction).toBe("wait");
     expect(s.blockers.wait).toEqual(["waiting for cubic-dev-ai to review aaaaaaa"]);
-    expect(s.reviewBots).toEqual([{ bot: "cubic-dev-ai", reviewedHead: false, skippedHead: false, rereviewRequested: false, waitedSecs: 0 }]);
+    expect(s.reviewBots).toEqual([{ bot: "cubic-dev-ai", reviewedHead: false, skippedHead: false, checksRunning: [], rereviewRequested: false, waitedSecs: 0 }]);
     const late = run(p, { state, now: T0 + 900 });
     expect(late.nextAction).toBe("ask-user");
     expect(late.blockers.human).toEqual(["cubic-dev-ai has not reviewed aaaaaaa after 15m (skipped, out of quota, or needs a trigger)"]);
@@ -598,6 +598,20 @@ describe("review bots on the head commit", () => {
     const s = run(p, { state, now: T0 + 900 });
     expect(s.checksSkipped).toEqual(["cubic · AI code reviewer"]);
     expect(s.blockers.human).toEqual(["cubic-dev-ai has not reviewed aaaaaaa after 15m (its check was skipped)"]);
+  });
+
+  // minipaw#3: Greptile's check ran 24m; it was reported as "out of quota" at 15m, 5m before it posted
+  test("a bot whose own check is still running is waited on past the grace period", () => {
+    const p = withCheck(pr({ reviews: { nodes: [review(501, "greptile-apps", "old")] }, comments: { nodes: [handled(501)] } }),
+      { __typename: "CheckRun", name: "Greptile Review", status: "IN_PROGRESS", conclusion: null, detailsUrl: "", checkSuite: { app: { slug: "greptile-apps" } } });
+    const state = stateDir();
+    run(p, { state });
+    const s = run(p, { state, now: T0 + 1500 });
+    expect([s.nextAction, s.wakeOnEvent, s.blockers.human]).toEqual(["wait", true, []]);
+    expect(s.blockers.wait).toContain("greptile-apps is reviewing aaaaaaa (its check is running)");
+    const stuck = run(p, { state, now: T0 + 3601 });
+    expect([stuck.nextAction, stuck.blockers.wait]).toEqual(["ask-user", []]);
+    expect(stuck.blockers.human).toEqual(["1 checks still running after 60m: Greptile Review"]);
   });
 
   test("on a new PR, bots that review this repo's merged PRs are expected before they post", () => {
