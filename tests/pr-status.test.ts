@@ -33,33 +33,42 @@ function pr(over: Record<string, unknown> = {}) {
   };
 }
 
-// merged-PR history for the repo-level bot check: one entry per PR, listing author types
-// "more" marks a PR with more comments than the check fetches
-const history = (...prs: ("Bot" | "User" | "more")[][]) => ({ data: { repository: { pullRequests: { nodes:
-  prs.map((types) => ({
-    comments: { pageInfo: { hasNextPage: types.includes("more") }, nodes: types.filter((t) => t !== "more").map((t) => ({ author: { __typename: t } })) },
-    reviews: { pageInfo: { hasNextPage: false }, nodes: [] },
-  })) } } } });
+// merged-PR history for the repo-level review-bot check: one entry per PR, listing who reviewed it
+const history = (...prs: Author[][]) => ({ data: { repository: { pullRequests: { nodes:
+  prs.map((authors) => ({ reviews: { nodes: authors.map((author) => ({ author })) } })) } } } });
 
 // fixtures: one response, or a list served in order (last one repeats)
-function run(fixtures: object | object[], opts: { args?: string[]; env?: Record<string, string>; cwd?: string; history?: object } = {}) {
+// a fixture that makes that gh call fail
+const FAIL = {};
+type RunOpts = { args?: string[]; env?: Record<string, string>; cwd?: string; history?: object; state?: string; now?: number };
+// seconds since epoch for the fixture clock; heads are first seen at whatever `now` the first run uses
+const T0 = Date.parse("2026-01-10T00:00:00Z") / 1000;
+const stateDir = () => mkdtempSync(join(tmpdir(), "prs-state-"));
+
+function run(fixtures: object | object[], opts: RunOpts = {}) {
+  const r = exec(fixtures, opts);
+  if (r.exitCode !== 0) throw new Error(r.stderr.toString() || r.stdout.toString());
+  return JSON.parse(r.stdout.toString());
+}
+
+function exec(fixtures: object | object[], opts: RunOpts = {}) {
   const dir = mkdtempSync(join(tmpdir(), "prs-"));
-  const list = (Array.isArray(fixtures) ? fixtures : [fixtures]).map((p) => ({ data: { viewer: { login: ME }, repository: { pullRequest: p } } }));
-  list.forEach((f, i) => writeFileSync(join(dir, `f${i}.json`), JSON.stringify(f)));
+  const list = (Array.isArray(fixtures) ? fixtures : [fixtures]).map((p) => p === FAIL ? FAIL : ({ data: { viewer: { login: ME }, repository: { pullRequest: p } } }));
+  list.forEach((f, i) => writeFileSync(join(dir, `f${i}.json`), f === FAIL ? "FAIL\n" : JSON.stringify(f)));
   writeFileSync(join(dir, "history.json"), JSON.stringify(opts.history ?? history()));
   writeFileSync(join(dir, "gh"), `#!/bin/sh
 case "$*" in *recentBotCheck*) cat "${dir}/history.json"; exit;; esac
 n=$(cat "${dir}/count" 2>/dev/null || echo 0); echo $((n+1)) > "${dir}/count"
 i=$n; [ $i -ge ${list.length} ] && i=${list.length - 1}
+if [ "$(cat "${dir}/f$i.json")" = FAIL ]; then echo "HTTP 502" >&2; exit 1; fi
 cat "${dir}/f$i.json"\n`);
   chmodSync(join(dir, "gh"), 0o755);
-  const r = Bun.spawnSync(["bash", SCRIPT, ...(opts.args ?? ["7"])], {
+  return Bun.spawnSync(["bash", SCRIPT, ...(opts.args ?? ["7"])], {
     cwd: opts.cwd ?? dir,
     // stop git from finding an enclosing repo when TMPDIR itself lives inside one
-    env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, GH_REPO: "o/r", GIT_CEILING_DIRECTORIES: dirname(opts.cwd ?? dir), ...opts.env },
+    env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, GH_REPO: "o/r", GIT_CEILING_DIRECTORIES: dirname(opts.cwd ?? dir),
+           BABYSIT_STATE_DIR: opts.state ?? join(dir, "state"), BABYSIT_NOW: String(opts.now ?? T0), ...opts.env },
   });
-  if (r.exitCode !== 0) throw new Error(r.stderr.toString());
-  return JSON.parse(r.stdout.toString());
 }
 
 describe("baseline", () => {
@@ -274,12 +283,16 @@ describe("top-level comments and reviews", () => {
     expect(s.newComments.map((c: any) => c.id)).toEqual([91, 92, 93]);
   });
 
-  test("r2#3 new bot top-level comments must be read (block) until a marker lists them", () => {
-    const s = run(pr({ comments: { nodes: [cm(95, bot("cubic-dev-ai"), "P1: null deref in x.ts", 5)] } }));
-    expect(s.newComments.map((c: any) => c.id)).toEqual([95]);
-    expect(s.nextAction).toBe("fix");
-    const after = run(pr({ comments: { nodes: [cm(95, bot("cubic-dev-ai"), "P1", 5), cm(96, user(ME), "fixed\n<!-- baby-sit handled:95 -->", 6)] } }));
-    expect(after.nextAction).toBe("done");
+  // minip2p#281: walkthroughs, "review in progress", previews and rate-limit notes ended every
+  // --wait early and each needed its own marker comment
+  test("bot top-level comments are listed for reading but never block; a marker clears them", () => {
+    const s = run(pr({ comments: { nodes: [cm(95, bot("coderabbitai"), "<!-- review in progress by coderabbit.ai -->\nCurrently processing new changes", 5)] } }));
+    expect(s.newComments).toEqual([]);
+    expect(s.botComments.map((c: any) => c.id)).toEqual([95]);
+    expect(s.summaryMarker).toBe("<!-- baby-sit handled:95 -->");
+    expect(s.nextAction).toBe("done");
+    const after = run(pr({ comments: { nodes: [cm(95, bot("coderabbitai"), "walkthrough", 5), cm(96, user(ME), "noted\n<!-- baby-sit handled:95 -->", 6)] } }));
+    expect(after.botComments).toEqual([]);
   });
 
   test("r2#7 handled ids come only from the trailing marker, not quoted text", () => {
@@ -290,10 +303,18 @@ describe("top-level comments and reviews", () => {
     expect(s.newComments.map((c: any) => c.id)).toEqual([91]);
   });
 
-  test("r2#8 an item edited after it was handled comes back", () => {
-    const edited = { ...cm(91, bot("coderabbitai"), "summary v2 with new finding", 1), lastEditedAt: "2026-01-09T00:00:00Z" };
+  test("r2#8 a human comment edited after it was handled comes back", () => {
+    const edited = { ...cm(91, user("alice"), "also handle retries", 1), lastEditedAt: "2026-01-09T00:00:00Z" };
     const s = run(pr({ comments: { nodes: [edited, cm(92, user(ME), "ok\n<!-- baby-sit handled:91 -->", 3)] } }));
     expect(s.newComments.map((c: any) => c.id)).toEqual([91]);
+  });
+
+  // minip2p#273: CodeRabbit and Greptile rewrite their summary comment on every push
+  test("a bot refreshing a handled summary comment or review is not new work", () => {
+    const summary = { ...cm(91, bot("greptile-apps"), "Confidence 5/5 (updated)", 1), lastEditedAt: "2026-01-09T00:00:00Z" };
+    const review = { databaseId: 500, author: bot("coderabbitai"), state: "COMMENTED", body: "Actionable comments posted: 0 (edited)", submittedAt: "2026-01-02T00:00:00Z", lastEditedAt: "2026-01-09T00:00:00Z", commit: { oid: HEAD } };
+    const s = run(pr({ reviews: { nodes: [review] }, comments: { nodes: [summary, cm(92, user(ME), "ok\n<!-- baby-sit handled:91,500 -->", 3)] } }));
+    expect([s.botComments, s.newReviews, s.nextAction]).toEqual([[], [], "done"]);
   });
 
   test("r2#5 a long reply keeps its marker; long feedback is flagged truncated", () => {
@@ -344,12 +365,15 @@ describe("merge state", () => {
     expect(s.blockers.human[0]).toStartWith("blocked by branch protection");
   });
 
-  test("#10 repo with no checks is not blocked forever", () => {
+  // useaspen#475: right after a push no checks exist yet, and that was reported as done
+  test("#10 no checks on a fresh head is a wait; a repo without CI is not blocked forever", () => {
     const p = pr();
     (p.commits.nodes[0]!.commit as any).statusCheckRollup = null;
-    const s = run(p);
-    expect(s.ci).toBe("NONE");
-    expect(s.nextAction).toBe("done");
+    const state = stateDir();
+    const fresh = run(p, { state });
+    expect([fresh.ci, fresh.nextAction, fresh.blockers.wait]).toEqual(["NONE", "wait", ["no checks reported on aaaaaaa yet"]]);
+    expect(run(p, { state, now: T0 + 149 }).nextAction).toBe("wait");
+    expect(run(p, { state, now: T0 + 150 }).nextAction).toBe("done");
   });
 
   test("#11 merged or closed PR stops the loop", () => {
@@ -415,7 +439,12 @@ describe("#2 / r2#9 local checkout", () => {
   });
   test("stale checkout", () => expect(at(repo("c next; git rev-parse HEAD > .head; git reset -q --hard HEAD~1")).local.relation).toBe("behind"));
   test("diverged", () => expect(at(repo("c theirs; git rev-parse HEAD > .head; git reset -q --hard HEAD~1; c mine")).local.relation).toBe("diverged"));
-  test("dirty worktree blocks", () => expect(at(repo("echo x > f.txt")).blockers.agent).toContain("1 uncommitted local changes"));
+  test("changes to tracked files block", () => expect(at(repo("echo x > t.txt && git add t.txt")).blockers.agent).toContain("1 uncommitted local changes"));
+  // useaspen#460: a stray build file made --wait return "fix" at once
+  test("untracked files are reported but do not block", () => {
+    const s = at(repo("echo x > build.log"));
+    expect([s.local.dirty, s.local.untracked, s.nextAction]).toEqual([0, 1, "done"]);
+  });
   test("r3#5 fork: base remote is the one pointing at the PR repo, not origin", () => {
     const s = at(repo("git remote set-url origin git@github.com:me/r.git && git remote add upstream https://github.com/o/r.git"));
     expect(s.local.baseRemote).toBe("upstream");
@@ -424,87 +453,164 @@ describe("#2 / r2#9 local checkout", () => {
   test("different repo", () => expect(at(repo("git remote set-url origin git@github.com:x/other.git")).blockers.agent[0]).toBe("local checkout is not a clone of o/r"));
 });
 
+describe("checks that need a person", () => {
+  const withRollup = (state: string, ...nodes: object[]) => { const p = pr(); (p.commits.nodes[0]!.commit as any).statusCheckRollup = { state, contexts: { nodes } }; return p; };
+  const withChecks = (...nodes: object[]) => withRollup("PENDING", ...nodes);
+  const ci = { __typename: "CheckRun", name: "ci", status: "COMPLETED", conclusion: "SUCCESS", detailsUrl: "" };
+
+  // minip2p#281/#295: aws-bench waits for a deployment approval; --wait sat 31 minutes on it
+  test("a job waiting for approval asks the user at once instead of waiting", () => {
+    const s = run(withChecks(ci, { __typename: "CheckRun", name: "aws-bench", status: "WAITING", conclusion: null, detailsUrl: "u" }));
+    expect(s.checksPending).toEqual([]);
+    expect(s.nextAction).toBe("ask-user");
+    expect(s.blockers.human).toContain("check aws-bench is waiting for someone to approve it");
+  });
+
+  test("action_required is a question for the user, not a failure to fix", () => {
+    const s = run(withRollup("FAILURE", { __typename: "CheckRun", name: "deploy", status: "COMPLETED", conclusion: "ACTION_REQUIRED", detailsUrl: "u" }));
+    expect([s.checksFailed, s.nextAction]).toEqual([[], "ask-user"]);
+  });
+
+  test("a check still running long after the push is reported, not waited on forever", () => {
+    const p = withChecks({ __typename: "CheckRun", name: "e2e", status: "IN_PROGRESS", conclusion: null, detailsUrl: "" });
+    const state = stateDir();
+    expect(run(p, { state }).nextAction).toBe("wait");
+    const late = run(p, { state, now: T0 + 3601 });
+    expect(late.nextAction).toBe("ask-user");
+    expect(late.blockers.human).toContain("1 checks still running after 60m: e2e");
+  });
+});
+
+describe("review bots on the head commit", () => {
+  const review = (id: number, login: string, oid: string, body = "Looks good") =>
+    ({ databaseId: id, author: bot(login), state: "COMMENTED", body, submittedAt: "2026-01-04T00:00:00Z", commit: { oid } });
+  const handled = (...ids: number[]) => cm(900, user(ME), `ok\n<!-- baby-sit handled:${ids.join(",")} -->`, 8);
+  const withCheck = (p: any, node: object) => { p.commits.nodes[0].commit.statusCheckRollup.contexts.nodes.push(node); return p; };
+
+  // baibai#16/#18: "Cubic: all reported issues addressed" quoted a review of the previous commit
+  test("a bot whose last review is on an older commit is waited for, then asked about", () => {
+    const p = pr({ reviews: { nodes: [review(501, "cubic-dev-ai", "old")] }, comments: { nodes: [handled(501)] } });
+    const state = stateDir();
+    const s = run(p, { state });
+    expect(s.nextAction).toBe("wait");
+    expect(s.blockers.wait).toEqual(["waiting for cubic-dev-ai to review aaaaaaa"]);
+    expect(s.reviewBots).toEqual([{ bot: "cubic-dev-ai", reviewedHead: false, skippedHead: false, rereviewRequested: false, waitedSecs: 0 }]);
+    const late = run(p, { state, now: T0 + 900 });
+    expect(late.nextAction).toBe("ask-user");
+    expect(late.blockers.human).toEqual(["cubic-dev-ai has not reviewed aaaaaaa after 15m (skipped, out of quota, or needs a trigger)"]);
+  });
+
+  test("a review on the head commit counts", () => {
+    const s = run(pr({ reviews: { nodes: [review(501, "cubic-dev-ai", "old"), review(502, "cubic-dev-ai", HEAD)] }, comments: { nodes: [handled(501, 502)] } }));
+    expect([s.reviewBots[0].reviewedHead, s.nextAction]).toEqual([true, "done"]);
+  });
+
+  test("a passed bot check on the head counts (CodeRabbit posts 'Review completed' as a status)", () => {
+    const p = withCheck(pr({ reviews: { nodes: [review(501, "coderabbitai", "old")] }, comments: { nodes: [handled(501)] } }),
+      { __typename: "StatusContext", context: "CodeRabbit", state: "SUCCESS", targetUrl: "" });
+    expect(run(p).nextAction).toBe("done");
+  });
+
+  test("a bot comment in a review thread after the head appeared counts", () => {
+    const p = pr({ reviews: { nodes: [review(501, "greptile-apps", "old")] }, comments: { nodes: [handled(501)] },
+      reviewThreads: { totalCount: 1, nodes: [thread("G", true, [cm(7, bot("greptile-apps"), "nit", 11)])] } });
+    expect(run(p).reviewBots[0].reviewedHead).toBe(true);
+  });
+
+  // minip2p#73/#76: cubic showed "skipping" and was read as a pass
+  test("a skipped bot check is not a review, and the report says it was skipped", () => {
+    const p = withCheck(pr({ reviews: { nodes: [review(501, "cubic-dev-ai", "old")] }, comments: { nodes: [handled(501)] } }),
+      { __typename: "CheckRun", name: "cubic · AI code reviewer", status: "COMPLETED", conclusion: "SKIPPED", detailsUrl: "" });
+    const state = stateDir();
+    run(p, { state });
+    const s = run(p, { state, now: T0 + 900 });
+    expect(s.checksSkipped).toEqual(["cubic · AI code reviewer"]);
+    expect(s.blockers.human).toEqual(["cubic-dev-ai has not reviewed aaaaaaa after 15m (its check was skipped)"]);
+  });
+
+  test("on a new PR, bots that review this repo's merged PRs are expected before they post", () => {
+    const s = run(pr(), { history: history([bot("coderabbitai"), user("alice")], [user("bob")]) });
+    expect(s.blockers.wait).toEqual(["waiting for coderabbitai to review aaaaaaa"]);
+  });
+
+  test("a repo without review bots is done as soon as CI is", () => {
+    expect(run(pr(), { history: history([user("alice")], []) }).nextAction).toBe("done");
+  });
+
+  test("BABYSIT_IGNORE_BOTS drops a bot from the expected reviewers", () => {
+    const s = run(pr(), { history: history([bot("coderabbitai")]), env: { BABYSIT_IGNORE_BOTS: "coderabbitai" } });
+    expect([s.reviewBots, s.nextAction]).toEqual([[], "done"]);
+  });
+
+  test("a recorded re-review request restarts that bot's grace period", () => {
+    const p = pr({ reviews: { nodes: [review(501, "greptile-apps", "old")] }, comments: { nodes: [handled(501)] } });
+    const state = stateDir();
+    run(p, { state });
+    expect(run(p, { state, now: T0 + 900 }).nextAction).toBe("ask-user");
+    run([], { state, now: T0 + 1000, args: ["--record", "rereview", "greptile-apps", "7"] });
+    const s = run(p, { state, now: T0 + 1100 });
+    expect([s.nextAction, s.reviewBots[0].rereviewRequested, s.reviewBots[0].waitedSecs]).toEqual(["wait", true, 100]);
+  });
+});
+
+describe("--record", () => {
+  test("rounds and reopened threads are remembered and reported", () => {
+    const state = stateDir();
+    run([], { state, args: ["--record", "round", "7"] });
+    run([], { state, args: ["--record", "round", "7"] });
+    run([], { state, args: ["--record", "reopen", "T1", "7"] });
+    expect(run(pr(), { state }).session).toEqual({ rounds: 2, reopenedThreads: ["T1"] });
+  });
+
+  test("a re-review before any status run fails without wiping the state", () => {
+    const state = stateDir();
+    run([], { state, args: ["--record", "round", "7"] });
+    expect(exec([], { state, args: ["--record", "rereview", "greptile-apps", "7"] }).exitCode).not.toBe(0);
+    expect(run(pr(), { state }).session.rounds).toBe(1);
+  });
+});
+
+describe("GitHub errors", () => {
+  const fast = { RETRY_DELAY: "0" };
+
+  test("a transient failure is retried", () => {
+    expect(run([FAIL, FAIL, pr()], { env: fast }).nextAction).toBe("done");
+  });
+
+  test("three failures give nextAction error and exit 1, with JSON on stdout", () => {
+    const r = exec([FAIL], { env: fast });
+    expect(r.exitCode).toBe(1);
+    expect(JSON.parse(r.stdout.toString()).nextAction).toBe("error");
+  });
+});
+
 describe("#12 --wait", () => {
   const pending = () => {
     const p = pr();
     (p.commits.nodes[0]!.commit as any).statusCheckRollup = { state: "PENDING", contexts: { nodes: [{ __typename: "CheckRun", name: "ci", status: "QUEUED", conclusion: null, detailsUrl: "" }] } };
     return p;
   };
-  const fast = { POLL_SECS: "0", SETTLE_SECS: "0" };
+  const fast = { POLL_SECS: "0", RETRY_DELAY: "0" };
 
-  test("polls until checks finish, then reports", () => {
+  test("polls until there is something to do, then reports", () => {
     const s = run([pending(), pending(), pr()], { args: ["--wait", "7"], env: { ...fast, WAIT_SECS: "60" } });
-    expect(s.nextAction).toBe("done");
-    expect(s.waitResult).toBe("settled");
+    expect([s.nextAction, s.waitResult]).toEqual(["done", "changed"]);
   });
 
-  test("r2#11 work arriving while CI still runs returns early as actionable, not as a finished wait", () => {
+  test("r2#11 work arriving while CI still runs returns at once", () => {
     const busy = pending();
     busy.comments = { nodes: [cm(91, user("alice"), "one more thing", 5)] };
     const s = run([pending(), busy], { args: ["--wait", "7"], env: { ...fast, WAIT_SECS: "60" } });
-    expect(s.waitResult).toBe("actionable");
-    expect(s.checksPending).toEqual(["ci"]);
+    expect([s.nextAction, s.waitResult, s.checksPending]).toEqual(["fix", "changed", ["ci"]]);
   });
 
-  test("gives up after WAIT_SECS on a stuck check", () => {
-    const s = run([pending()], { args: ["--wait", "7"], env: { POLL_SECS: "1", SETTLE_SECS: "0", WAIT_SECS: "2" } });
-    expect(s.waitResult).toBe("timed-out");
-    expect(s.timedOut).toBe(true);
+  test("returns still-waiting after WAIT_SECS so one call fits in a tool timeout", () => {
+    const s = run([pending()], { args: ["--wait", "7"], env: { POLL_SECS: "1", WAIT_SECS: "2" } });
+    expect([s.nextAction, s.waitResult]).toEqual(["wait", "still-waiting"]);
   });
-});
 
-describe("--wait bot settle skip", () => {
-  // a clone in sync with the PR, so the local checkout doesn't block
-  const clone = () => {
-    const dir = mkdtempSync(join(tmpdir(), "prs-settle-"));
-    Bun.spawnSync(["sh", "-c", `git init -q -b feat && git remote add origin git@github.com:o/r.git
-      git -c user.email=a@b -c user.name=a commit -q --allow-empty -m x`], { cwd: dir });
-    const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: dir }).stdout.toString().trim();
-    return { dir, head };
-  };
-  const env = { POLL_SECS: "0", SETTLE_SECS: "2", WAIT_SECS: "60" };
-  const wait = (p: object, cwd?: string) => run(p, { args: ["--wait", "7"], env, cwd });
-
-  test("no bots: first wait settles, later waits skip", () => {
-    const c = clone();
-    const first = wait(pr({ headRefOid: c.head }), c.dir);
-    expect([first.nextAction, first.settleSkipped, first.botsSeen]).toEqual(["done", false, false]);
-    expect(first.waitedSecs).toBeGreaterThanOrEqual(2);
-    const second = wait(pr({ headRefOid: c.head }), c.dir);
-    expect(second.settleSkipped).toBe(true);
-    expect(second.waitedSecs).toBeLessThan(2);
-  }, 20_000);
-
-  test("a bot has posted: never skips", () => {
-    const c = clone();
-    const withBot = pr({ headRefOid: c.head, comments: { nodes: [
-      cm(95, bot("coderabbitai"), "summary", 1), cm(96, user(ME), "ok\n<!-- baby-sit handled:95 -->", 2)] } });
-    wait(withBot, c.dir);
-    const again = wait(withBot, c.dir);
-    expect([again.botsSeen, again.settleSkipped]).toEqual([true, false]);
-  }, 20_000);
-
-  test("outside a clone: never skips on its own", () => {
-    wait(pr());
-    expect(wait(pr()).settleSkipped).toBe(false);
-  }, 20_000);
-
-  test("repo with no bots on recent merged PRs: skips even on the first wait", () => {
-    const s = run(pr(), { args: ["--wait", "7"], env, history: history(["User"], ["User", "User"]) });
-    expect(s.settleSkipped).toBe(true);
-    expect(s.waitedSecs).toBeLessThan(2);
-  }, 20_000);
-
-  test("repo where a bot reviewed a recent PR: first wait still runs", () => {
-    const s = run(pr(), { args: ["--wait", "7"], env, history: history(["User"], ["Bot"]) });
-    expect(s.settleSkipped).toBe(false);
-  }, 20_000);
-
-  test("busy PR in history with more comments than fetched: first wait still runs", () => {
-    expect(run(pr(), { args: ["--wait", "7"], env, history: history(["User"], ["User", "more"]) }).settleSkipped).toBe(false);
-  }, 20_000);
-
-  test("repo with no merged PRs: first wait still runs", () => {
-    expect(run(pr(), { args: ["--wait", "7"], env, history: history() }).settleSkipped).toBe(false);
-  }, 20_000);
+  test("a failed poll is retried on the next poll instead of ending the wait", () => {
+    const s = run([pending(), FAIL, FAIL, FAIL, pr()], { args: ["--wait", "7"], env: { ...fast, WAIT_SECS: "60" } });
+    expect([s.nextAction, s.waitResult]).toEqual(["done", "changed"]);
+  });
 });
