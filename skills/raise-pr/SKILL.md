@@ -21,7 +21,7 @@ SETUP_CMD="<install deps, e.g. pnpm install --frozen-lockfile --prefer-offline>"
   <this skill's dir>/scripts/cross-review.sh <round> <codex|claude> <prompt-file> [base-branch]
 ```
 
-Run it from the repo root, in the background; a round takes a few minutes. The script reviews committed work in a throwaway worktree and pins the base on round 1. If it fails (CLI missing, auth, rate limit), ask the user whether to switch reviewer or skip.
+Run it from the repo root, in the background; a round takes a few minutes. The script reviews committed work in a throwaway worktree, pins the base on round 1, and tells the reviewer the round number (and on round 3, that it is the last). If it fails (CLI missing, auth, rate limit), ask the user whether to switch reviewer or skip.
 
 Round 1 prompt:
 
@@ -50,7 +50,7 @@ Push, then `gh pr create --base <base>` (`--draft` only if asked). Body:
 - **Summary:** what and why, 2-4 bullets.
 - **Plan:** path or link, if any.
 - **Testing:** commands run and what you verified.
-- **Cross-review:** reviewer and model; per round, fixed and declined (with reason).
+- **Cross-review:** reviewer and model; per round, fixed and declined (with reason). Mark fixes made after the last round you ran as "not re-reviewed".
 - **Follow-ups:** leftover findings, or "none".
 
 ## 4. Baby-sit

@@ -14,6 +14,7 @@ set -euo pipefail
 ROUND="${1:?round}"; REVIEWER="${2:?codex|claude}"; PROMPT="$(cd "$(dirname "${3:?prompt file}")" && pwd)/$(basename "$3")"
 BASE="${4:-}"
 EFFORT="${EFFORT:-medium}"
+[[ "$ROUND" =~ ^[1-3]$ ]] || { echo "round must be 1, 2 or 3" >&2; exit 2; }
 
 [[ -z "$(git status --porcelain)" ]] || { echo "commit your work first: the reviewer only sees commits" >&2; exit 1; }
 
@@ -40,6 +41,9 @@ if [[ -n "${SETUP_CMD:-}" ]]; then
 fi
 
 { echo "Base commit: $BASE_SHA. Review \`git diff $BASE_SHA...HEAD\`. Do not edit any files."
+  echo "This is review round $ROUND of at most 3."
+  # nothing reviews the fixes for round 3 findings, so the reviewer should weigh that
+  [[ "$ROUND" == 3 ]] && echo "This is the last round: your findings will be fixed without another review. Report only issues worth fixing without one, and say if a fix is too risky to make unreviewed."
   # the claude reviewer may only run commands that start with TEST_CMD; pipes, cd, or env prefixes get denied
   [[ -n "${TEST_CMD:-}" ]] && echo "To run tests, use \`$TEST_CMD\` (optionally followed by paths or flags) as a plain command: no pipes, redirects, cd, or env prefixes."
   echo; cat "$PROMPT"; } > "$STATE/prompt-$ROUND.md"
