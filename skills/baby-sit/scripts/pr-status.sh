@@ -148,7 +148,7 @@ query($owner:String!,$name:String!,$pr:Int!){
       mergeable mergeStateStatus reviewDecision
       commits(last:1){nodes{commit{oid statusCheckRollup{state
         contexts(first:100){totalCount nodes{
-          ... on CheckRun{__typename name status conclusion detailsUrl checkSuite{app{slug}}}
+          ... on CheckRun{__typename name status conclusion title detailsUrl checkSuite{app{slug}}}
           ... on StatusContext{__typename context state targetUrl creator{login}}
         }}}}}}
       reviewThreads(first:100){totalCount nodes{id isResolved isOutdated path line originalLine
@@ -285,6 +285,7 @@ status() {
        approval:(.status == "WAITING" or .conclusion == "ACTION_REQUIRED"),
        passed:(.conclusion == "SUCCESS" or .state == "SUCCESS"),
        skipped:(.conclusion == "SKIPPED" or .conclusion == "NEUTRAL"),
+       title:(.title // null),
        pending:((.__typename == "CheckRun" and .status != "COMPLETED" and .status != "WAITING") or .state == "PENDING" or .state == "EXPECTED"),
        failed:((.conclusion as $x | ["FAILURE","TIMED_OUT","CANCELLED","STARTUP_FAILURE"] | index($x) != null)
                or .state == "FAILURE" or .state == "ERROR")})) as $checks
@@ -314,13 +315,18 @@ status() {
            any($p.reviews.nodes[]; .author.login == $b and .commit.oid == $p.headRefOid and .state != "PENDING")
            or any($bc[]; .passed)),
          skippedHead:any($bc[]; .skipped),
+         # the title of the skipped check says why ("AI review line limit reached")
+         skipReason:([$bc[] | select(.skipped) | .title // "no reason given"][0]),
          # its own check still running on the head: it is reviewing now, however long that takes
          checksRunning:[$bc[] | select(.pending) | .name],
          rereviewRequested:(rereviewAt($b) > 0),
          waitedSecs:($now - ([$headSince, rereviewAt($b)] | max))} ] as $bots
   | [ $bots[] | select(.reviewedHead | not) ] as $botsBehind
+  # a bot that skipped the head has already answered, so there is nothing to wait for. After a
+  # re-review request, it gets the grace period again.
+  | def gaveUp: .skippedHead and (.rereviewRequested | not) and (.checksRunning | length) == 0;
 
-  | [ $p.reviews.nodes[] | select(.state != "PENDING")
+    [ $p.reviews.nodes[] | select(.state != "PENDING")
       | select((.body // "") != "" or .state == "CHANGES_REQUESTED")
       | (c + {state, onHead:(.commit.oid == $head.oid)}) | select(unhandled) ] as $reviews
   | [ $reviews[] | select(newToUs) ] as $newReviews
@@ -392,15 +398,15 @@ status() {
         (if (.checksPending | length) == 0 and (.checksAwaitingApproval | length) == 0 and ($ci == "PENDING" or $ci == "EXPECTED") then "CI is pending" else empty end),
         (if $ci == "NONE" and $headAge < $noChecksGrace then "no checks reported on \(.head[0:7]) yet" else empty end),
         ($botsBehind[] | select((.checksRunning - $stuckChecks | length) > 0) | "\(.bot) is reviewing \($p.headRefOid[0:7]) (its check is running)"),
-        ($botsBehind[] | select(.waitedSecs < $botGrace and (.checksRunning | length) == 0) | "waiting for \(.bot) to review \($p.headRefOid[0:7])"),
+        ($botsBehind[] | select(.waitedSecs < $botGrace and (.checksRunning | length) == 0 and (gaveUp | not)) | "waiting for \(.bot) to review \($p.headRefOid[0:7])"),
         (if .mergeable == "UNKNOWN" or .mergeState == "UNKNOWN" then "GitHub is still computing mergeability" else empty end)
       ],
       human: ([
         (.checksAwaitingApproval[] | "check \(.name) is waiting for someone to approve it"),
         (if ($stuckChecks | length) > 0 then "\($stuckChecks | length) checks still running after \($stuck | mins): \($stuckChecks | join(", "))" else empty end),
-        ($botsBehind[] | select(.waitedSecs >= $botGrace and (.checksRunning | length) == 0)
-         | "\(.bot) has not reviewed \($p.headRefOid[0:7]) after \(.waitedSecs | mins)"
-           + (if .skippedHead then " (its check was skipped)" else " (skipped, out of quota, or needs a trigger)" end)),
+        ($botsBehind[] | select((.waitedSecs >= $botGrace and (.checksRunning | length) == 0) or gaveUp)
+         | if .skippedHead then "\(.bot) skipped reviewing \($p.headRefOid[0:7]) (\(.skipReason))"
+           else "\(.bot) has not reviewed \($p.headRefOid[0:7]) after \(.waitedSecs | mins) (skipped, out of quota, or needs a trigger)" end),
         (if .reviewDecision == "REVIEW_REQUIRED" then "awaiting required approval" else empty end),
         (if .reviewDecision == "CHANGES_REQUESTED" then "changes requested; reviewer must re-review or dismiss" else empty end),
         ((.threadsAwaitingHumans | length) as $n | if $n > 0 then "\($n) answered human threads still open" else empty end),

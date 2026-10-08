@@ -526,7 +526,7 @@ describe("review bots on the head commit", () => {
     const s = run(p, { state });
     expect(s.nextAction).toBe("wait");
     expect(s.blockers.wait).toEqual(["waiting for cubic-dev-ai to review aaaaaaa"]);
-    expect(s.reviewBots).toEqual([{ bot: "cubic-dev-ai", reviewedHead: false, skippedHead: false, checksRunning: [], rereviewRequested: false, waitedSecs: 0 }]);
+    expect(s.reviewBots).toEqual([{ bot: "cubic-dev-ai", reviewedHead: false, skippedHead: false, skipReason: null, checksRunning: [], rereviewRequested: false, waitedSecs: 0 }]);
     const late = run(p, { state, now: T0 + 900 });
     expect(late.nextAction).toBe("ask-user");
     expect(late.blockers.human).toEqual(["cubic-dev-ai has not reviewed aaaaaaa after 15m (skipped, out of quota, or needs a trigger)"]);
@@ -593,11 +593,22 @@ describe("review bots on the head commit", () => {
   test("a skipped bot check is not a review, and the report says it was skipped", () => {
     const p = withCheck(pr({ reviews: { nodes: [review(501, "cubic-dev-ai", "old")] }, comments: { nodes: [handled(501)] } }),
       { __typename: "CheckRun", name: "cubic · AI code reviewer", status: "COMPLETED", conclusion: "SKIPPED", detailsUrl: "", checkSuite: { app: { slug: "cubic-dev-ai" } } });
-    const state = stateDir();
-    run(p, { state });
-    const s = run(p, { state, now: T0 + 900 });
+    const s = run(p);
     expect(s.checksSkipped).toEqual(["cubic · AI code reviewer"]);
-    expect(s.blockers.human).toEqual(["cubic-dev-ai has not reviewed aaaaaaa after 15m (its check was skipped)"]);
+    expect(s.blockers.human).toEqual(["cubic-dev-ai skipped reviewing aaaaaaa (no reason given)"]);
+  });
+
+  // qop#23: cubic's check said "AI review line limit reached" at once; it was waited on for 15m
+  test("a bot that skipped the head is reported at once with its reason, and waited on again after a re-review request", () => {
+    const p = withCheck(pr({ reviews: { nodes: [review(501, "cubic-dev-ai", "old")] }, comments: { nodes: [handled(501)] } }),
+      { __typename: "CheckRun", name: "cubic · AI code reviewer", status: "COMPLETED", conclusion: "NEUTRAL", title: "AI review line limit reached", detailsUrl: "", checkSuite: { app: { slug: "cubic-dev-ai" } } });
+    const state = stateDir();
+    const s = run(p, { state });
+    expect([s.nextAction, s.blockers.wait]).toEqual(["ask-user", []]);
+    expect(s.blockers.human).toEqual(["cubic-dev-ai skipped reviewing aaaaaaa (AI review line limit reached)"]);
+    run([], { state, now: T0 + 60, args: ["--record", "rereview", "cubic-dev-ai", "7"] });
+    expect(run(p, { state, now: T0 + 120 }).blockers.wait).toEqual(["waiting for cubic-dev-ai to review aaaaaaa"]);
+    expect(run(p, { state, now: T0 + 960 }).blockers.human).toEqual(["cubic-dev-ai skipped reviewing aaaaaaa (AI review line limit reached)"]);
   });
 
   // minipaw#3: Greptile's check ran 24m; it was reported as "out of quota" at 15m, 5m before it posted
