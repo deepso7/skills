@@ -278,7 +278,7 @@ status() {
 
   | ($head.statusCheckRollup.contexts.nodes // [] | map(
       # what the check says about itself: the run title and first summary line, or the status description
-      ([.title, (.summary // "" | split("\n") | map(select(test("\\S"))) | .[0] // null | if . then .[0:120] else . end),
+      ([.title, (.summary // "" | split("\n") | map(select(test("\\S"))) | .[0] // null | if . and length > 120 then .[0:120] + "…" else . end),
         .description] | map(select(. != null and . != "")) | unique | if length > 0 then join(": ") else null end) as $note
       # a bot that hit a limit can still mark its check green ("Review rate limited")
       | (($note // "") | test("rate.?limit|limit reached|quota|skipped"; "i")) as $limited
