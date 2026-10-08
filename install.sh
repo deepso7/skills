@@ -3,6 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 dest="${AGENT_SKILLS_DIR:-$HOME/.agents/skills}"
+mkdir -p "$dest"
 for s in skills/*/; do
   name="$(basename "$s")"
   rm -rf "$dest/$name.new" && cp -R "$s" "$dest/$name.new"

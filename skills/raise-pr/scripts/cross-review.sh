@@ -2,8 +2,7 @@
 # Usage: cross-review.sh <round 1-3> <codex|claude> <prompt-file> [base-branch]
 #
 # Runs a read-only review of committed work by another agent, in a throwaway worktree.
-# Prints the review to stdout. The base commit is pinned on round 1 and reused after,
-# so every round reviews the same diff: `git diff <base>...HEAD`.
+# Prints the review to stdout. The base commit is pinned on round 1 and reused after.
 #
 # Env: SETUP_CMD  run in the worktree before the review, e.g. "pnpm install --frozen-lockfile --prefer-offline"
 #                 (worktrees start without node_modules; the sandboxed reviewer can't install them)
@@ -18,6 +17,7 @@ EFFORT="${EFFORT:-medium}"
 
 [[ -z "$(git status --porcelain)" ]] || { echo "commit your work first: the reviewer only sees commits" >&2; exit 1; }
 
+HEAD_SHA="$(git rev-parse HEAD)"
 STATE="$(git rev-parse --absolute-git-dir)/cross-review/$(git rev-parse --abbrev-ref HEAD | tr '/' '_')"
 mkdir -p "$STATE"
 
@@ -33,7 +33,7 @@ BASE_SHA="$(cat "$STATE/base.sha")"
 
 # fresh worktree per round, outside .git (Codex's sandbox protects .git), with its own TMPDIR
 WT="$(mktemp -d "${TMPDIR:-/tmp}/cross-review.XXXXXX")/wt"
-git worktree add -q --detach "$WT" HEAD
+git worktree add -q --detach "$WT" "$HEAD_SHA"
 trap 'git worktree remove --force "$WT" 2>/dev/null || true; rm -rf "$(dirname "$WT")"' EXIT
 mkdir -p "$WT/.tmp"
 if [[ -n "${SETUP_CMD:-}" ]]; then
@@ -94,5 +94,6 @@ if (( rc != 0 )) || [[ ! -s "$OUT" ]]; then
   exit 5
 fi
 
-[[ -z "$(git status --porcelain)" ]] || { echo "WARNING: your checkout changed during review; not touching it" >&2; exit 3; }
+[[ -z "$(git status --porcelain)" && "$(git rev-parse HEAD)" == "$HEAD_SHA" ]] ||
+  { echo "WARNING: your checkout changed during review (this review is of $HEAD_SHA); not touching it" >&2; exit 3; }
 cat "$OUT"

@@ -7,20 +7,14 @@
 # Prints one JSON object describing everything between the PR and merge, and a
 # `nextAction`: fix | wait | ask-user | done | stop | error.
 #
-# "done" needs CI and every review bot to have finished on the current head commit:
-#   - no checks on a head first seen under NO_CHECKS_GRACE (default 150s) ago is a wait, since
-#     CI may not have registered yet; after that a repo without CI is fine.
-#   - review bots are the bots that reviewed this PR or one of the repo's last 10 merged PRs
-#     (cached for a day), plus known AI reviewers (CodeRabbit, Greptile, cubic, Copilot, ...) that
-#     posted anything on this PR. BABYSIT_IGNORE_BOTS=login,login skips some. A bot is current when
-#     it submitted a review of the head commit or its own check passed on the head. A bot that is
-#     not current is a wait while its own check runs on the head (up to CHECK_STUCK_SECS), otherwise
-#     for BOT_GRACE (default 900s) after the head appeared or a re-review was recorded; then it is a
-#     question for the user.
-#   - wakeOnEvent says whether the wait ends on a PR event (checks finishing) that a PR watcher
-#     would report, or only on a timer. tellUserNow lists things a person must do right away.
-#   - checks waiting for a manual approval, or running over CHECK_STUCK_SECS (default 3600s),
-#     are questions for the user.
+# "done" means nothing is left on the current head commit:
+#   - no checks on a head seen under NO_CHECKS_GRACE (150s) is a wait; after that, no CI is fine.
+#   - review bots: bots that reviewed this PR or one of the last 10 merged PRs (cached a day), plus
+#     known AI reviewers seen on this PR. BABYSIT_IGNORE_BOTS=login,login skips some. A bot is
+#     current once it reviewed the head or its own check passed on it. Until then it is a wait while
+#     its check runs, else for BOT_GRACE (900s); a bot whose check skipped the head goes to the user.
+#   - checks awaiting approval or running over CHECK_STUCK_SECS (3600s) go to the user.
+#   - wakeOnEvent: the wait ends on an event a PR watcher reports; false means a timer is needed.
 #
 # --wait  POLL_SECS (default 45) between checks, WAIT_SECS (default 540) in total so it fits in
 #         one tool call. Adds waitResult: changed | still-waiting. Run it again on still-waiting.
@@ -87,12 +81,11 @@ write_state() {  # stdin -> $1, atomically
   local tmp
   tmp="$(mktemp "$STATE_DIR/.tmp.XXXXXX")" && cat > "$tmp" && mv "$tmp" "$1"
 }
-# take_lock <file>: creates it holding our pid, or fails if it exists. bash's noclobber opens it
-# with O_EXCL, which is atomic on every platform. mkdir is not: uutils mkdir (Ubuntu 26.04) lets
-# several racing processes all "create" the same directory. macOS has no flock.
+# take_lock <file>: creates it holding our pid, or fails if it exists (noclobber is O_EXCL: atomic,
+# unlike uutils mkdir; macOS has no flock).
 take_lock() { ( set -C; echo $$ > "$1" ) 2>/dev/null; }
-# break_lock <lock> <stale-owner>: removes a stale lock. Only one process may do it at a time, and
-# only if the lock still has the owner it saw, so a lock someone else just took is never removed.
+# break_lock <lock> <stale-owner>: removes a stale lock, one breaker at a time, only if it still
+# has the owner seen, so a lock just taken by someone else survives.
 break_lock() {
   local lock="$1" seen="$2"
   if take_lock "$lock.break"; then
@@ -252,22 +245,18 @@ status() {
       | ([$cs | to_entries[] | select(.value.mine) | .key] | max) as $lastOurs
       | {id, resolved:$resolved, outdated:.isOutdated, path, line:(.line // .originalLine),
          total:.comments.totalCount, replyTo:$cs[0].id, botThread:$cs[0].bot, comments:$cs,
-         # on resolved threads bots edit their comments ("✅ addressed") and reply to confirm
-         # fixes; counting those would loop forever. So there, bot edits and bot replies do
-         # not block; new bot replies are listed in botRepliesOnResolved for the agent to read.
-         # On open threads a bot edit can be a rewritten finding, so it still counts.
-         # resolved threads count only: human replies after our last answer, human edits to
-         # handled items, and anything humans posted after baby-sit started on this PR
+         # On resolved threads bots edit ("✅ addressed") and reply to confirm fixes; counting that
+         # would loop forever, so there only human activity after baby-sit started counts, and new
+         # bot replies go to botRepliesOnResolved. On open threads a bot edit can be a new finding.
          unhandled:[ $cs | to_entries[]
-                     | select(.value | unhandled and (($resolved and .bot and editedAfterHandled) | not))
+                     | select(.value | unhandled)
                      | select(($resolved and .value.bot) | not)
                      | select(($resolved | not)
                               or ($lastOurs != null and .key > $lastOurs)
                               or (.value | editedAfterHandled)
                               or ($since != null and .value.at > $since))
                      | .value.id ],
-         # same window as unhandled above, for the bot comments it leaves out; only comments
-         # no marker ever covered, so a bot editing a handled comment does not resurface it
+         # same window, for bot comments no marker covered
          botReplies:[ if $resolved then
                         $cs | to_entries[]
                         | select(.value.bot and (.value.mine | not) and $handledAt[.value.id | tostring] == null
@@ -277,11 +266,12 @@ status() {
     ] as $threads
 
   | ($head.statusCheckRollup.contexts.nodes // [] | map(
-      # what the check says about itself: the run title and first summary line, or the status description
-      ([.title, (.summary // "" | split("\n") | map(select(test("\\S"))) | .[0] // null | if . and length > 120 then .[0:120] + "…" else . end),
-        .description] | map(select(. != null and . != "")) | unique | if length > 0 then join(": ") else null end) as $note
       # a bot that hit a limit can still mark its check green ("Review rate limited")
-      | (($note // "") | test("rate.?limit|limit reached|quota|skipped"; "i")) as $limited
+      ([.title, .summary, .description] | map(. // "") | join(" ")
+       | test("rate.?limit|limit reached|out of quota|quota (exceeded|reached)|review (was )?skipped|skipped review"; "i")) as $limited
+      # what the check says about itself: the run title and first summary line, or the status description
+      | ([.title, (.summary // "" | split("\n") | map(select(test("\\S"))) | .[0] // null | if . and length > 120 then .[0:120] + "…" else . end),
+        .description] | map(select(. != null and . != "")) | unique | if length > 0 then join(": ") else null end) as $note
       | {name:(.name // .context), url:(.detailsUrl // .targetUrl),
        owner:(.checkSuite.app.slug // .creator.login // null),
        kind:(if ((.detailsUrl // "") | test("/actions/runs/")) then "actions" else "external" end),
@@ -299,17 +289,18 @@ status() {
   # "coderabbitai" -> "coderabbit", "cubic-dev-ai" -> "cubic", "greptile-apps" -> "greptile"; matches check names
   | def botKey: ascii_downcase | sub("\\[bot\\]$"; "") | split("-")[0] | sub("ai$"; "");
   # review bots: bots that reviewed this PR or recent merged PRs, plus known AI reviewers that
-  # posted anything on this PR (their first act is often a "review in progress" comment).
-  # Other commenting bots (previews, deploys) are not reviewers.
+  # posted anything or have a check on this PR. Other bots (previews, deploys) are not reviewers.
     ["coderabbit","greptile","cubic","copilot","sourcery","ellipsis","qodo","gemini","codeant","cursor","bugbot","graphite","korbit"] as $knownReviewers
   | ($ignoreBots | split(",") | map(select(length > 0))) as $ignored
   | ([ ($p.reviews.nodes[] | select(.author.__typename == "Bot") | .author.login),
        ([$p.comments.nodes[], $p.reviewThreads.nodes[].comments.nodes[]][]
-        | select(.author.__typename == "Bot") | .author.login | select(botKey as $k | $knownReviewers | index($k)))
-     ] + $repoBots | unique - $ignored) as $reviewBots
-  # the check the bot itself posted ("CodeRabbit" status, "cubic · AI code reviewer" run), matched
+        | select(.author.__typename == "Bot") | .author.login | select(botKey as $k | $knownReviewers | index($k))),
+       ($checks[] | .owner // empty | select(botKey as $k | $knownReviewers | index($k)))
+     ] + $repoBots | unique - $ignored | unique_by(botKey)) as $reviewBots
+  # the check a known reviewer posted ("CodeRabbit" status, "cubic · AI code reviewer" run), matched
   # by the app or account that created it; a CI job named after the bot is not it
-  | def botCheck($b): ($b | botKey) as $k | [$checks[] | select(.owner != null and (.owner | botKey) == $k)];
+  | def botCheck($b): ($b | botKey) as $k
+      | if $knownReviewers | index($k) then [$checks[] | select(.owner != null and (.owner | botKey) == $k)] else [] end;
     def rereviewAt($b): $state.rereview[$p.headRefOid][$b] // 0;
     [ $reviewBots[] as $b
       | (botCheck($b)) as $bc
@@ -421,12 +412,10 @@ status() {
   | if .mergeState == "BLOCKED" and ([.blockers[][]] | length) == 0
     then .blockers.human += ["blocked by branch protection (required checks, approvals, or signed commits)"] else . end
   | .ready = (.state == "OPEN" and ([.blockers[][]] | length) == 0)
-  # a PR watcher (T3 Code) wakes on check results, comments and reviews. It never wakes for a
-  # grace period running out: CI that never registers, or a review bot that stays silent. Nor
-  # for a bot check that never finishes: without required checks, "all checks passed" waits on
-  # it too, so once its bot is past the grace period a timer has to back the watcher up.
+  # a PR watcher (T3 Code) wakes on check results, comments and reviews, never on a grace period
+  # running out: CI that never registers, or a review bot that stays silent or whose check hangs
   | .wakeOnEvent = (((.checksPending - $stuckChecks | length) > 0
-                     and ([$botsBehind[] | select(.waitedSecs >= $botGrace and (.checksRunning | length) > 0)] | length) == 0)
+                     and (.blockers.wait | any(test(" is reviewing | to review ")) | not))
                     or (.blockers.wait | any(test("^CI is pending|^GitHub is still computing"))))
   # needs a person even though the rest is still running; say so now, keep watching the rest
   | .tellUserNow = [.checksAwaitingApproval[] | "check \(.name) is waiting for someone to approve it"]

@@ -552,6 +552,24 @@ describe("review bots on the head commit", () => {
     expect(s.blockers.human).toEqual(["coderabbitai skipped reviewing aaaaaaa (Review rate limited)"]);
   });
 
+  test("a review bot known only from its check is still a review bot", () => {
+    const p = withCheck(pr(), { __typename: "CheckRun", name: "cubic · AI code reviewer", status: "COMPLETED", conclusion: "NEUTRAL", title: "AI review line limit reached", detailsUrl: "", checkSuite: { app: { slug: "cubic-dev-ai" } } });
+    expect(run(p, { rawBots: true }).nextAction).toBe("ask-user");
+  });
+
+  test("limits are read from the full text, and a passing review that mentions quota is still a review", () => {
+    const status = (description: string) => withCheck(pr({ reviews: { nodes: [review(501, "coderabbitai", "old")] }, comments: { nodes: [handled(501)] } }),
+      { __typename: "StatusContext", context: "CodeRabbit", state: "SUCCESS", description, targetUrl: "", creator: { login: "coderabbitai" } });
+    expect(run(status("x".repeat(130) + " Review rate limited")).reviewBots[0].reviewedHead).toBe(false);
+    expect(run(status("Reviewed quota handling: no issues")).reviewBots[0].reviewedHead).toBe(true);
+  });
+
+  test("a passing check from a bot that is not a known reviewer is not its review", () => {
+    const p = withCheck(pr({ reviews: { nodes: [review(501, "github-actions", "old")] }, comments: { nodes: [handled(501)] } }),
+      { __typename: "CheckRun", name: "build", status: "COMPLETED", conclusion: "SUCCESS", detailsUrl: "", checkSuite: { app: { slug: "github-actions" } } });
+    expect(run(p).reviewBots[0].reviewedHead).toBe(false);
+  });
+
   test("a skipped check's reason includes the first line of its summary", () => {
     const p = withCheck(pr({ reviews: { nodes: [review(501, "greptile-apps", "old")] }, comments: { nodes: [handled(501)] } }),
       { __typename: "CheckRun", name: "Greptile Review", status: "COMPLETED", conclusion: "NEUTRAL", title: "Apex review", summary: "\nReview was cancelled\nmore", detailsUrl: "", checkSuite: { app: { slug: "greptile-apps" } } });
@@ -597,11 +615,14 @@ describe("review bots on the head commit", () => {
     expect([r.exitCode, JSON.parse(r.stdout.toString()).nextAction]).toEqual([1, "error"]);
   });
 
-  test("wakeOnEvent: a PR watcher wakes for running checks, not for a silent bot", () => {
-    const running = pr({ reviews: { nodes: [review(501, "cubic-dev-ai", "old")] }, comments: { nodes: [handled(501)] } });
-    expect(run(running).wakeOnEvent).toBe(false);
-    (running.commits.nodes[0]!.commit as any).statusCheckRollup = { state: "PENDING", contexts: { nodes: [{ __typename: "CheckRun", name: "ci", status: "IN_PROGRESS", conclusion: null, detailsUrl: "" }] } };
-    expect(run(running).wakeOnEvent).toBe(true);
+  test("wakeOnEvent: a PR watcher wakes for running checks, not for a bot it may never hear from", () => {
+    const rollup = { state: "PENDING", contexts: { nodes: [{ __typename: "CheckRun", name: "ci", status: "IN_PROGRESS", conclusion: null, detailsUrl: "" }] } };
+    const ci = pr(); (ci.commits.nodes[0]!.commit as any).statusCheckRollup = rollup;
+    expect(run(ci).wakeOnEvent).toBe(true);
+    const bot = pr({ reviews: { nodes: [review(501, "cubic-dev-ai", "old")] }, comments: { nodes: [handled(501)] } });
+    expect(run(bot).wakeOnEvent).toBe(false);
+    (bot.commits.nodes[0]!.commit as any).statusCheckRollup = rollup;
+    expect(run(bot).wakeOnEvent).toBe(false);
   });
 
   // minip2p#73/#76: cubic showed "skipping" and was read as a pass
@@ -635,8 +656,8 @@ describe("review bots on the head commit", () => {
     const s = run(p, { state, now: T0 + 1500 });
     expect([s.nextAction, s.blockers.human]).toEqual(["wait", []]);
     expect(s.blockers.wait).toContain("greptile-apps is reviewing aaaaaaa (its check is running)");
-    // a PR watcher wakes when it finishes, but not if it hangs, so a timer backs it up
-    expect([run(p, { state, now: T0 + 600 }).wakeOnEvent, s.wakeOnEvent]).toEqual([true, false]);
+    // a PR watcher would not wake if it hangs, so a timer backs it up from the start
+    expect([run(p, { state, now: T0 + 600 }).wakeOnEvent, s.wakeOnEvent]).toEqual([false, false]);
     const stuck = run(p, { state, now: T0 + 3601 });
     expect([stuck.nextAction, stuck.blockers.wait]).toEqual(["ask-user", []]);
     expect(stuck.blockers.human).toEqual(["1 checks still running after 60m: Greptile Review"]);
