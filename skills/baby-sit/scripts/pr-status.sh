@@ -148,8 +148,8 @@ query($owner:String!,$name:String!,$pr:Int!){
       mergeable mergeStateStatus reviewDecision
       commits(last:1){nodes{commit{oid statusCheckRollup{state
         contexts(first:100){totalCount nodes{
-          ... on CheckRun{__typename name status conclusion title detailsUrl checkSuite{app{slug}}}
-          ... on StatusContext{__typename context state targetUrl creator{login}}
+          ... on CheckRun{__typename name status conclusion title summary detailsUrl checkSuite{app{slug}}}
+          ... on StatusContext{__typename context state description targetUrl creator{login}}
         }}}}}}
       reviewThreads(first:100){totalCount nodes{id isResolved isOutdated path line originalLine
         comments(first:100){totalCount nodes{databaseId author{login __typename} body createdAt lastEditedAt}}}}
@@ -277,15 +277,20 @@ status() {
     ] as $threads
 
   | ($head.statusCheckRollup.contexts.nodes // [] | map(
-      {name:(.name // .context), url:(.detailsUrl // .targetUrl),
+      # what the check says about itself: the run title and first summary line, or the status description
+      ([.title, (.summary // "" | split("\n") | map(select(test("\\S"))) | .[0] // null | if . then .[0:120] else . end),
+        .description] | map(select(. != null and . != "")) | unique | if length > 0 then join(": ") else null end) as $note
+      # a bot that hit a limit can still mark its check green ("Review rate limited")
+      | (($note // "") | test("rate.?limit|limit reached|quota|skipped"; "i")) as $limited
+      | {name:(.name // .context), url:(.detailsUrl // .targetUrl),
        owner:(.checkSuite.app.slug // .creator.login // null),
        kind:(if ((.detailsUrl // "") | test("/actions/runs/")) then "actions" else "external" end),
        runId:((.detailsUrl // "") | capture("/actions/runs/(?<id>[0-9]+)").id // null),
        # a job held by an environment protection rule, or a run that needs someone to approve it
        approval:(.status == "WAITING" or .conclusion == "ACTION_REQUIRED"),
-       passed:(.conclusion == "SUCCESS" or .state == "SUCCESS"),
-       skipped:(.conclusion == "SKIPPED" or .conclusion == "NEUTRAL"),
-       title:(.title // null),
+       passed:((.conclusion == "SUCCESS" or .state == "SUCCESS") and ($limited | not)),
+       skipped:(.conclusion == "SKIPPED" or .conclusion == "NEUTRAL" or ((.conclusion == "SUCCESS" or .state == "SUCCESS") and $limited)),
+       note:$note,
        pending:((.__typename == "CheckRun" and .status != "COMPLETED" and .status != "WAITING") or .state == "PENDING" or .state == "EXPECTED"),
        failed:((.conclusion as $x | ["FAILURE","TIMED_OUT","CANCELLED","STARTUP_FAILURE"] | index($x) != null)
                or .state == "FAILURE" or .state == "ERROR")})) as $checks
@@ -315,8 +320,8 @@ status() {
            any($p.reviews.nodes[]; .author.login == $b and .commit.oid == $p.headRefOid and .state != "PENDING")
            or any($bc[]; .passed)),
          skippedHead:any($bc[]; .skipped),
-         # the title of the skipped check says why ("AI review line limit reached")
-         skipReason:([$bc[] | select(.skipped) | .title // "no reason given"][0]),
+         # the skipped check says why ("AI review line limit reached", "Review rate limited")
+         skipReason:([$bc[] | select(.skipped) | .note // "no reason given"][0]),
          # its own check still running on the head: it is reviewing now, however long that takes
          checksRunning:[$bc[] | select(.pending) | .name],
          rereviewRequested:(rereviewAt($b) > 0),

@@ -21,9 +21,9 @@ Run `scripts/pr-status.sh N` and act on `nextAction`:
 
 | `nextAction` | Do |
 |---|---|
-| `fix` | Handle every item in `blockers.agent` (below), push, reply, `--record round`, then wait |
+| `fix` | Handle every item in `blockers.agent` (below), push, reply, `--record round`, then run the check again and act on it |
 | `wait` | Wait (see **Waiting**). `blockers.wait` says for what. Keep waiting even if `blockers.human` has items; report them when `nextAction` changes, not before |
-| `ask-user` | Read `botComments` and `botRepliesOnResolved` first; if you reopened a thread, check again. Otherwise stop and report `blockers.human` |
+| `ask-user` | Read `botComments` and `botRepliesOnResolved` first; if you reopened a thread, check again. Otherwise stop and report `blockers.human`. If the only ones are review bots that skipped for a quota or plan limit, the status is `READY (not reviewed by <bot>: <skipReason>)` |
 | `done` | Same reads as `ask-user`, then the final report |
 | `stop` | PR merged or closed; report |
 | `error` | GitHub failed 3 times. Wait and check once more; if it fails again, stop and report |
@@ -39,7 +39,7 @@ Use the first mode your environment supports, and say which one you're using in 
 2. **Background commands wake you when they finish** (Claude Code): run `scripts/pr-status.sh --wait N` in the background and end your turn. On `waitResult: still-waiting`, start it again.
 3. **Neither** (e.g. Codex or a plain CLI): run `scripts/pr-status.sh --wait N` in the foreground; it returns within 9 minutes. Repeat on `still-waiting`, at most 6 times in a row. Then stop and report the status, and tell the user to ask again later.
 
-Never end a turn while saying you are babysitting unless mode 1 or 2 will wake you. Don't write your own `sleep` / `gh pr checks --watch` loops; `--wait` already polls cheaply and returns on anything new.
+Never end a turn while saying you are babysitting unless mode 1 or 2 will wake you. Decide from the latest check's `wakeOnEvent`, so read it every time; after a push, check again first. Don't write your own `sleep` / `gh pr checks --watch` loops; `--wait` already polls cheaply and returns on anything new.
 
 In every mode, if `tellUserNow` is not empty (e.g. a deployment waiting for approval), tell the user in one line right away and keep going with the rest.
 
@@ -47,7 +47,7 @@ In every mode, if `tellUserNow` is not empty (e.g. a deployment waiting for appr
 
 - **Checks:** `kind: actions`: run `gh run view <runId> --log-failed` and fix the cause. For obvious infra flakes, run `gh run rerun <runId> --failed` once. `kind: external`: open its `url`. Checks in `checksAwaitingApproval` need a person; never approve them yourself.
 - **Feedback:** `threadsToAddress`, `newReviews`, and `newComments`. Read whole threads, because later replies can change the ask. If `truncated`, fetch the full body: `gh api repos/{owner}/{repo}/{issues/comments|pulls/comments}/<id>` or `.../pulls/N/reviews/<id>`. Verify each item against the code. Fix the valid ones at the root cause; decline the rest with a one-line reason.
-- **Bot top-level comments** (`botComments`, not blocking): walkthroughs, "review in progress", previews, rate-limit notes. Read them each check, since a few carry real findings; handle those like feedback. List all their ids in your next PR comment's marker so they stop showing up.
+- **Bot top-level comments** (`botComments`, not blocking): walkthroughs, "review in progress", previews, rate-limit notes. Read them each check, since a few carry real findings; handle those like feedback. List all their ids in your next PR comment's marker so they stop showing up; never post a comment just to carry the marker.
 - **Bot replies on resolved threads** (`botRepliesOnResolved`, not blocking): read them every check (fetch `truncated` ones in full). If one pushes back or raises something new, reopen the thread so it moves to `threadsToAddress`, and run `--record reopen <threadId>`: `gh api graphql -f query='mutation($id:ID!){unresolveReviewThread(input:{threadId:$id}){thread{isResolved}}}' -f id=<threadId>`. Never reopen a thread listed in `session.reopenedThreads`; leave it resolved, add the reply's id to your PR comment's marker, and report it under `Bot follow-ups`. Confirmations need no reply; list their ids in your next PR comment's marker.
 - **Bot acknowledgements anywhere** ("thanks", "confirmed", "LGTM"): never reply in the thread, since bots answer replies and that loops. Add their ids to your PR comment's marker instead.
 - **Review bot behind** (`reviewBots[].reviewedHead` false): wait while it is in `blockers.wait`. When it moves to `blockers.human`, you may ask it to review once per head commit (`@coderabbitai review`, `@greptileai review`, `@cubic-dev-ai review`) and run `--record rereview <bot-login>`; skip this if `rereviewRequested` is already true, or if its `skipReason` is a quota or plan limit (asking again won't help; report it). Each request can use up the bot's quota.

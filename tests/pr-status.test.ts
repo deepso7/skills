@@ -543,6 +543,21 @@ describe("review bots on the head commit", () => {
     expect(run(p).nextAction).toBe("done");
   });
 
+  // minipaw#4: CodeRabbit marked its status green with "Review rate limited" and was counted as a review
+  test("a green bot status that says it hit a limit is a skip, not a review", () => {
+    const p = withCheck(pr({ reviews: { nodes: [review(501, "coderabbitai", "old")] }, comments: { nodes: [handled(501)] } }),
+      { __typename: "StatusContext", context: "CodeRabbit", state: "SUCCESS", description: "Review rate limited", targetUrl: "", creator: { login: "coderabbitai" } });
+    const s = run(p);
+    expect([s.reviewBots[0].reviewedHead, s.nextAction]).toEqual([false, "ask-user"]);
+    expect(s.blockers.human).toEqual(["coderabbitai skipped reviewing aaaaaaa (Review rate limited)"]);
+  });
+
+  test("a skipped check's reason includes the first line of its summary", () => {
+    const p = withCheck(pr({ reviews: { nodes: [review(501, "greptile-apps", "old")] }, comments: { nodes: [handled(501)] } }),
+      { __typename: "CheckRun", name: "Greptile Review", status: "COMPLETED", conclusion: "NEUTRAL", title: "Apex review", summary: "\nReview was cancelled\nmore", detailsUrl: "", checkSuite: { app: { slug: "greptile-apps" } } });
+    expect(run(p).reviewBots[0].skipReason).toBe("Apex review: Review was cancelled");
+  });
+
   test("a CI job named after the bot is not the bot's review", () => {
     const p = withCheck(pr({ reviews: { nodes: [review(501, "coderabbitai", "old")] }, comments: { nodes: [handled(501)] } }),
       { __typename: "CheckRun", name: "CodeRabbit integration tests", status: "COMPLETED", conclusion: "SUCCESS", detailsUrl: "", checkSuite: { app: { slug: "github-actions" } } });
