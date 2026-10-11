@@ -1,6 +1,6 @@
 ---
 name: baby-sit
-description: Watch a GitHub PR and keep fixing it until it is green and ready to merge - CI, review-bot comments (CodeRabbit, Greptile, cubic, Copilot), nested thread replies, and human comments. Use when the user says "babysit", "watch the PR", "until PR is green", "CI is failing", or "address the review comments", and at the end of raise-pr.
+description: Watch one or more GitHub PRs and keep fixing them until green and ready to merge - CI, review-bot comments (CodeRabbit, Greptile, cubic, Copilot), nested thread replies, and human comments. Use whenever the user says "babysit", "watch the PR", "until PR is green", "CI is failing", or "address the review comments", including as the last step of a bigger request or for several PRs at once, and at the end of raise-pr.
 ---
 
 # Baby-sit a PR
