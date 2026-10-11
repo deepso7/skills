@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Usage: cross-review.sh <round 1-3> <codex|claude> <prompt-file> [base-branch]
+# Usage: cross-review.sh [--prompt-only] <round 1-3> <codex|claude> <prompt-file> [base-branch]
 #
 # Runs a read-only review of committed work by another agent, in a throwaway worktree.
 # Prints the review to stdout. The base commit is pinned on round 1 and reused after.
+# --prompt-only prints the reviewer prompt instead, for running the review some other way.
 #
 # Env: SETUP_CMD  run in the worktree before the review, e.g. "pnpm install --frozen-lockfile --prefer-offline"
 #                 (worktrees start without node_modules; the sandboxed reviewer can't install them)
@@ -10,10 +11,17 @@
 #      CODEX_MODEL / CLAUDE_MODEL / EFFORT   override gpt-6.1-sol / claude-opus-5-5 / medium
 set -euo pipefail
 
+PROMPT_ONLY=""; [[ "${1:-}" == --prompt-only ]] && { PROMPT_ONLY=1; shift; }
 ROUND="${1:?round}"; REVIEWER="${2:?codex|claude}"; PROMPT="$(cd "$(dirname "${3:?prompt file}")" && pwd)/$(basename "$3")"
 BASE="${4:-}"
 EFFORT="${EFFORT:-medium}"
 [[ "$ROUND" =~ ^[1-3]$ ]] || { echo "round must be 1, 2 or 3" >&2; exit 2; }
+case "$REVIEWER" in
+  codex) MODEL="${CODEX_MODEL:-gpt-6.1-sol}" ;;
+  claude) MODEL="${CLAUDE_MODEL:-claude-opus-5-5}" ;;
+  *) echo "reviewer must be codex or claude" >&2; exit 2 ;;
+esac
+[[ -r "$PROMPT" ]] || { echo "cannot read $PROMPT" >&2; exit 2; }
 
 [[ -z "$(git status --porcelain)" ]] || { echo "commit your work first: the reviewer only sees commits" >&2; exit 1; }
 
@@ -31,6 +39,18 @@ if [[ "$ROUND" == 1 || ! -f "$STATE/base.sha" ]]; then
 fi
 BASE_SHA="$(cat "$STATE/base.sha")"
 
+{ echo "Base commit: $BASE_SHA. Review \`git diff $BASE_SHA...$HEAD_SHA\`. Do not edit any files."
+  echo "This is review round $ROUND of at most 3."
+  # nothing reviews the fixes for round 3 findings, so the reviewer should weigh that
+  [[ "$ROUND" == 3 ]] && echo "This is the last round: your findings will be fixed without another review. Report only issues worth fixing without one, and say if a fix is too risky to make unreviewed."
+  if [[ -n "${TEST_CMD:-}" ]]; then
+    # the claude CLI reviewer may only run commands that start with TEST_CMD; pipes, cd, or env prefixes get denied
+    if [[ -n $PROMPT_ONLY ]]; then echo "To run tests, use \`$TEST_CMD\`."
+    else echo "To run tests, use \`$TEST_CMD\` (optionally followed by paths or flags) as a plain command: no pipes, redirects, cd, or env prefixes."; fi
+  fi
+  echo; cat "$PROMPT"; } > "$STATE/prompt-$ROUND.md"
+[[ -n $PROMPT_ONLY ]] && { cat "$STATE/prompt-$ROUND.md"; exit 0; }
+
 # fresh worktree per round, outside .git (Codex's sandbox protects .git), with its own TMPDIR
 WT="$(mktemp -d "${TMPDIR:-/tmp}/cross-review.XXXXXX")/wt"
 git worktree add -q --detach "$WT" "$HEAD_SHA"
@@ -40,23 +60,11 @@ if [[ -n "${SETUP_CMD:-}" ]]; then
   (cd "$WT" && bash -c "$SETUP_CMD") > "$STATE/setup-$ROUND.log" 2>&1 || { echo "SETUP_CMD failed, see $STATE/setup-$ROUND.log" >&2; exit 4; }
 fi
 
-{ echo "Base commit: $BASE_SHA. Review \`git diff $BASE_SHA...HEAD\`. Do not edit any files."
-  echo "This is review round $ROUND of at most 3."
-  # nothing reviews the fixes for round 3 findings, so the reviewer should weigh that
-  [[ "$ROUND" == 3 ]] && echo "This is the last round: your findings will be fixed without another review. Report only issues worth fixing without one, and say if a fix is too risky to make unreviewed."
-  # the claude reviewer may only run commands that start with TEST_CMD; pipes, cd, or env prefixes get denied
-  [[ -n "${TEST_CMD:-}" ]] && echo "To run tests, use \`$TEST_CMD\` (optionally followed by paths or flags) as a plain command: no pipes, redirects, cd, or env prefixes."
-  echo; cat "$PROMPT"; } > "$STATE/prompt-$ROUND.md"
 OUT="$STATE/review-$ROUND.md"
 
 LOG="$STATE/$REVIEWER-$ROUND.log"
 rm -f "$OUT"
 rc=0
-case "$REVIEWER" in
-  codex) MODEL="${CODEX_MODEL:-gpt-6.1-sol}" ;;
-  claude) MODEL="${CLAUDE_MODEL:-claude-opus-5-5}" ;;
-  *) echo "reviewer must be codex or claude" >&2; exit 2 ;;
-esac
 case "$REVIEWER" in
   codex)
     # writes allowed only inside the throwaway worktree (tests need temp files); no /tmp, no network
