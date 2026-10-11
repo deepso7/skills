@@ -57,6 +57,9 @@ GH_FAILED='GitHub API calls failed 3 times; check `gh auth status` and try again
 failed() { jq -n --arg pr "${PR:-}" --arg msg "$1" '{pr:($pr | tonumber? // $pr), nextAction:"error", error:$msg}'; }
 
 PR="${1:-}"
+if (( $# > 1 )) || [[ -n $PR && ! $PR =~ ^[0-9]+$ ]]; then
+  echo "usage: pr-status.sh [--wait | --record <event> [value]] [pr-number]" >&2; exit 2
+fi
 if [[ -z $PR ]] && ! PR="$(retry gh pr view --json number -q .number)"; then
   failed "no PR found for the current branch, or $GH_FAILED"; exit 1
 fi
@@ -266,9 +269,10 @@ status() {
     ] as $threads
 
   | ($head.statusCheckRollup.contexts.nodes // [] | map(
-      # a bot that hit a limit can still mark its check green ("Review rate limited")
+      # a bot that hit a limit or passed on the commit can still mark its check green
+      # ("Review rate limited", "AI review not needed for merged PR commit")
       ([.title, .summary, .description] | map(. // "") | join(" ")
-       | test("rate.?limit|limit reached|out of quota|quota (exceeded|reached)|review (was )?skipped|skipped review"; "i")) as $limited
+       | test("rate.?limit|limit reached|out of quota|quota (exceeded|reached)|review (was )?skipped|skipped review|not needed"; "i")) as $limited
       # what the check says about itself: the run title and first summary line, or the status description
       | ([.title, (.summary // "" | split("\n") | map(select(test("\\S"))) | .[0] // null | if . and length > 120 then .[0:120] + "…" else . end),
         .description] | map(select(. != null and . != "")) | unique | if length > 0 then join(": ") else null end) as $note
@@ -413,8 +417,9 @@ status() {
     then .blockers.human += ["blocked by branch protection (required checks, approvals, or signed commits)"] else . end
   | .ready = (.state == "OPEN" and ([.blockers[][]] | length) == 0)
   # a PR watcher (T3 Code) wakes on check results, comments and reviews, never on a grace period
-  # running out: CI that never registers, or a review bot that stays silent or whose check hangs
-  | .wakeOnEvent = (((.checksPending - $stuckChecks | length) > 0
+  # running out: CI that never registers, or a review bot that stays silent or whose check hangs.
+  # With a check held for approval, the checks never all finish, so a pass sends no event either.
+  | .wakeOnEvent = (((.checksPending - $stuckChecks | length) > 0 and (.checksAwaitingApproval | length) == 0
                      and (.blockers.wait | any(test(" is reviewing | to review ")) | not))
                     or (.blockers.wait | any(test("^CI is pending|^GitHub is still computing"))))
   # needs a person even though the rest is still running; say so now, keep watching the rest

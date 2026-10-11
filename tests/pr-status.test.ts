@@ -486,6 +486,8 @@ describe("checks that need a person", () => {
     const s = run(withChecks({ __typename: "CheckRun", name: "aws-bench", status: "WAITING", conclusion: null, detailsUrl: "u" },
                              { __typename: "CheckRun", name: "test", status: "IN_PROGRESS", conclusion: null, detailsUrl: "" }));
     expect([s.nextAction, s.tellUserNow]).toEqual(["wait", ["check aws-bench is waiting for someone to approve it"]]);
+    // minip2p#333: test passed while aws-bench waited, and the watcher sent nothing
+    expect(s.wakeOnEvent).toBe(false);
   });
 
   test("action_required is a question for the user, not a failure to fix", () => {
@@ -562,6 +564,13 @@ describe("review bots on the head commit", () => {
       { __typename: "StatusContext", context: "CodeRabbit", state: "SUCCESS", description, targetUrl: "", creator: { login: "coderabbitai" } });
     expect(run(status("x".repeat(130) + " Review rate limited")).reviewBots[0].reviewedHead).toBe(false);
     expect(run(status("Reviewed quota handling: no issues")).reviewBots[0].reviewedHead).toBe(true);
+  });
+
+  // minipaw#4: cubic marked a commit merged from a stacked PR "AI review not needed" and was counted as a review
+  test("a green bot check that says no review was needed is a skip", () => {
+    const p = withCheck(pr({ reviews: { nodes: [review(501, "cubic-dev-ai", "old")] }, comments: { nodes: [handled(501)] } }),
+      { __typename: "CheckRun", name: "cubic · AI code reviewer", status: "COMPLETED", conclusion: "SUCCESS", title: "AI review not needed for merged PR commit", detailsUrl: "", checkSuite: { app: { slug: "cubic-dev-ai" } } });
+    expect(run(p).reviewBots[0]).toMatchObject({ reviewedHead: false, skippedHead: true, skipReason: "AI review not needed for merged PR commit" });
   });
 
   test("a passing check from a bot that is not a known reviewer is not its review", () => {
@@ -704,6 +713,12 @@ describe("--record", () => {
     run([], { state, args: ["--record", "round", "7"] });
     run([], { state, args: ["--record", "reopen", "T1", "7"] });
     expect(run(pr(), { state }).session).toEqual({ rounds: 2, reopenedThreads: ["T1"] });
+  });
+
+  // minipaw#7: `pr-status.sh 7 --record round` was read as a status check and the round was lost
+  test("arguments in the wrong order are rejected, not ignored", () => {
+    const r = exec(pr(), { args: ["7", "--record", "round"] });
+    expect([r.exitCode, r.stderr.toString()]).toEqual([2, expect.stringContaining("usage")]);
   });
 
   test("a re-review before any status run fails without wiping the state", () => {

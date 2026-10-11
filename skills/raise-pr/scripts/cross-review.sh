@@ -53,9 +53,14 @@ LOG="$STATE/$REVIEWER-$ROUND.log"
 rm -f "$OUT"
 rc=0
 case "$REVIEWER" in
+  codex) MODEL="${CODEX_MODEL:-gpt-6.1-sol}" ;;
+  claude) MODEL="${CLAUDE_MODEL:-claude-opus-5-5}" ;;
+  *) echo "reviewer must be codex or claude" >&2; exit 2 ;;
+esac
+case "$REVIEWER" in
   codex)
     # writes allowed only inside the throwaway worktree (tests need temp files); no /tmp, no network
-    TMPDIR="$WT/.tmp" codex exec -C "$WT" -m "${CODEX_MODEL:-gpt-6.1-sol}" -c model_reasoning_effort="$EFFORT" \
+    TMPDIR="$WT/.tmp" codex exec -C "$WT" -m "$MODEL" -c model_reasoning_effort="$EFFORT" \
       -s workspace-write -c sandbox_workspace_write.exclude_slash_tmp=true \
       -c sandbox_workspace_write.exclude_tmpdir_env_var=true \
       -c 'sandbox_workspace_write.writable_roots=[]' -c sandbox_workspace_write.network_access=false --ephemeral \
@@ -78,12 +83,11 @@ case "$REVIEWER" in
         while IFS= read -r -d '' kv; do export "$kv"; done < "$envfile"
         rm -f "$envfile"
       fi
-      cd "$WT" && claude -p --model "${CLAUDE_MODEL:-claude-opus-5-5}" --effort "$EFFORT" \
+      cd "$WT" && claude -p --model "$MODEL" --effort "$EFFORT" \
         --permission-mode dontAsk --setting-sources "" --strict-mcp-config \
         --tools "Read" "Grep" "Glob" "Bash" --allowedTools "${allowed[@]}" \
         < "$STATE/prompt-$ROUND.md" > "$OUT" 2> "$LOG"
     ) || rc=$? ;;
-  *) echo "reviewer must be codex or claude" >&2; exit 2 ;;
 esac
 
 # a failed or empty review must never look like a clean one
@@ -96,4 +100,5 @@ fi
 
 [[ -z "$(git status --porcelain)" && "$(git rev-parse HEAD)" == "$HEAD_SHA" ]] ||
   { echo "WARNING: your checkout changed during review (this review is of $HEAD_SHA); not touching it" >&2; exit 3; }
+echo "Reviewer: $REVIEWER $MODEL (effort $EFFORT), round $ROUND"
 cat "$OUT"

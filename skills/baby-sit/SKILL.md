@@ -11,7 +11,7 @@ Never merge or close the PR, rebase, or force push unless the user asked. Mergin
 
 ## Setup
 
-Pin the PR number `N` and pass it to every command. `gh pr checkout N`; if tracked files have changes you didn't make, stop and ask. Pick a waiting mode (below) and run the first check.
+Pin the PR number `N` and pass it last to every command (`pr-status.sh --record round N`). Several PRs: one baby-sit per PR. `gh pr checkout N`; if tracked files have changes you didn't make, stop and ask. Pick a waiting mode (below) and run the first check.
 
 ## Each check
 
@@ -41,17 +41,17 @@ In mode 1, end your turn on a `wait` only if the latest check says `wakeOnEvent:
 - **Failed checks:** `kind: actions`: `gh run view <runId> --log-failed` and fix the cause; for an obvious infra flake, `gh run rerun <runId> --failed` once. `kind: external`: open its `url`. Never approve `checksAwaitingApproval` yourself.
 - **Feedback** (`threadsToAddress`, `newReviews`, `newComments`): read whole threads; later replies can change the ask. Fetch `truncated` bodies in full: `gh api repos/{owner}/{repo}/{issues/comments|pulls/comments}/<id>` or `.../pulls/N/reviews/<id>`. Verify each item against the code; fix valid ones at the root cause, decline the rest with a one-line reason.
 - **Bot output that doesn't block** (`botComments`, `botRepliesOnResolved`): read it every check; a few carry real findings, handle those like feedback. If a bot reply on a resolved thread pushes back, reopen it (`gh api graphql -f query='mutation($id:ID!){unresolveReviewThread(input:{threadId:$id}){thread{isResolved}}}' -f id=<threadId>`) and `--record reopen <threadId>`, unless it is in `session.reopenedThreads`: then leave it and report it under `Bot follow-ups`.
-- **Never reply to a bot acknowledgement** ("thanks", "confirmed", "LGTM"); bots answer replies and that loops. Put its id, and the ids of bot output you read, in your next PR comment's marker; never post a comment just to carry a marker.
-- **Review bot behind** (`reviewedHead: false`): wait while it is in `blockers.wait`. Once it is in `blockers.human`, you may ask it once per head commit (`@coderabbitai review`, `@greptileai review`, `@cubic-dev-ai review`) and `--record rereview <bot-login>`, unless `rereviewRequested` is true or its `skipReason` is a quota or plan limit. Each request can use up the bot's quota.
+- **Never reply to a bot acknowledgement** ("thanks", "confirmed", "LGTM"); bots answer replies and that loops. Put its id, and the ids of bot output and review summaries you read, in the marker of your next thread reply or PR comment; never post a comment just to carry a marker.
+- **Review bot behind** (`reviewedHead: false`): wait while it is in `blockers.wait`. Once it is in `blockers.human`, you may ask it once per head commit (`@coderabbitai review`, `@greptileai review`, `@cubic-dev-ai review`) and `--record rereview <bot-login>`, unless `rereviewRequested` is true or its `skipReason` is a quota, plan or rate limit. Each request can use up the bot's quota.
 - **Local checkout:** follow the blocker text; if it is `diverged` or has changes you didn't make, stop and ask.
 - **Conflicts / behind base:** `git fetch <local.baseRemote> <base> && git merge <local.baseRemote>/<base>`.
 
-If you changed code: run lint, typecheck and tests, commit (`fix: address review feedback (round N)`), push, and `--record round`. Then reply.
+If you changed code: run lint, typecheck and tests, commit (`fix: address review feedback (round N)`), push, and `--record round`. If the fix changes something the PR body describes, update it (`gh pr edit N --body-file`). Then reply.
 
 ### Replying: the marker rule
 
 End **everything** you post with a marker as its very last line, or the item is never counted as handled:
-- **Threads:** `gh api repos/{owner}/{repo}/pulls/N/comments/<replyTo>/replies -f body=$'<what you did>\n\n<marker>'`, with the thread's `marker`.
+- **Threads:** `gh api repos/{owner}/{repo}/pulls/N/comments/<replyTo>/replies -F body=@<file>`, the file holding what you did, then the thread's `marker`.
 - **Reviews and comments:** one `gh pr comment N --body-file <file>` for all of them, ending with `summaryMarker` plus any ids from above (`handled:<ids>,<more ids>`).
 - **Anything else:** `<!-- baby-sit -->`.
 
@@ -79,4 +79,4 @@ Bot follow-ups: <reopened / confirmations only / none>
 Needs you: <approvals, decisions, or none>
 ```
 
-If the only human blockers are review bots that skipped for a quota or plan limit and `mergeState` is not `BLOCKED`, the status is `READY (not reviewed by <bot>: <skipReason>)`.
+If the only human blockers are review bots that skipped for a quota, plan or rate limit (or said no review was needed) and `mergeState` is not `BLOCKED`, the status is `READY (not reviewed by <bot>: <skipReason>)`.
