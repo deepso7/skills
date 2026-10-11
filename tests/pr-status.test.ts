@@ -488,6 +488,9 @@ describe("checks that need a person", () => {
     expect([s.nextAction, s.tellUserNow]).toEqual(["wait", ["check aws-bench is waiting for someone to approve it"]]);
     // minip2p#333: test passed while aws-bench waited, and the watcher sent nothing
     expect(s.wakeOnEvent).toBe(false);
+    const unknown = withChecks({ __typename: "CheckRun", name: "aws-bench", status: "WAITING", conclusion: null, detailsUrl: "u" });
+    unknown.mergeable = "UNKNOWN";
+    expect(run(unknown).wakeOnEvent).toBe(false);
   });
 
   test("action_required is a question for the user, not a failure to fix", () => {
@@ -564,6 +567,7 @@ describe("review bots on the head commit", () => {
       { __typename: "StatusContext", context: "CodeRabbit", state: "SUCCESS", description, targetUrl: "", creator: { login: "coderabbitai" } });
     expect(run(status("x".repeat(130) + " Review rate limited")).reviewBots[0].reviewedHead).toBe(false);
     expect(run(status("Reviewed quota handling: no issues")).reviewBots[0].reviewedHead).toBe(true);
+    expect(run(status("Reviewed: additional validation is not needed")).reviewBots[0].reviewedHead).toBe(true);
   });
 
   // minipaw#4: cubic marked a commit merged from a stacked PR "AI review not needed" and was counted as a review
