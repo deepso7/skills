@@ -7,7 +7,7 @@ description: Implement the agreed plan or discussed change, commit, get up to 3 
 
 ## 1. Implement
 
-- Source of truth: the plan file or what was agreed in this conversation. If unclear or conflicting, ask first.
+- Source of truth (the **spec**): the plan file, the issue being worked on, or what was agreed in this conversation. If unclear or conflicting, ask first.
 - On the base branch? Create a feature branch with a short name, no agent prefix (`codex/`, `claude/`).
 - Implement in logical commits. Before each commit run lint, format, typecheck and relevant tests.
 - Never amend or force push.
@@ -33,11 +33,22 @@ If a review fails (CLI missing, auth, rate limit, failed or empty task), ask the
 Round 1 prompt:
 
 ```
-Goal: <one paragraph>. Plan: <path or "none">.
-Review for correctness bugs, missed plan requirements, security issues, broken edge cases,
-missing tests for real behavior, and needless complexity. Skip lint-level nits.
-Output: `N. [high|medium|low] file:line - what breaks - suggested fix`, or exactly NO FINDINGS.
+Goal: <one paragraph>.
+Spec: <plan path; or the issue's number, title and requirements pasted in; or "none">.
+Review two axes separately:
+- Spec: does the change do what the spec asks, correctly? Missing or partial requirements,
+  behavior nobody asked for, correctness bugs, security issues, broken edge cases,
+  missing tests for real behavior.
+- Standards: does it follow this repo's documented rules? Read AGENTS.md, CLAUDE.md,
+  CODING_STANDARDS.md and CONTRIBUTING.md where present and cite the file and rule.
+  Also flag needless complexity.
+Skip lint-level nits and anything tooling already enforces.
+Output: under `## Spec` and `## Standards`, numbered across both,
+`N. [high|medium|low] file:line - what breaks - suggested fix`; write `none` under an empty heading.
+If both are empty, output exactly NO FINDINGS.
 ```
+
+Paste the issue's requirements rather than only its number: the reviewer runs without network or `gh`.
 
 Rounds 2 and 3 use the same prompt plus:
 
@@ -54,9 +65,10 @@ After each round:
 ## 3. Open the PR
 
 Push, then `gh pr create --base <base>` (`--draft` only if asked). Body:
-- **Summary:** what and why, 2-4 bullets.
-- **Plan:** path or link, if any.
-- **Testing:** commands run and what you verified.
+- **Summary:** what and why in a line or two, then the smallest visual that makes the change clear: a diff sketch, call tree, file tree, pseudocode, or Mermaid diagram. Skip the visual for a trivial change.
+- **Spec:** plan path or issue link (`Closes #N` when the PR resolves it), if any.
+- **Evidence:** before and after: the test or command that failed and now passes, its output, or a screenshot for a visual change. List the commands run.
+- **Merge danger:** one-way or two-way door (can it be rolled back cheaply?), and blast radius (what could break, and for whom).
 - **Cross-review:** reviewer and model (the script output's first line, or the delegated target); per round, fixed and declined (with reason). Mark fixes made after the last round you ran as "not re-reviewed".
 - **Follow-ups:** leftover findings, or "none".
 
