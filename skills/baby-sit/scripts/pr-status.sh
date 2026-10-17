@@ -384,7 +384,7 @@ status() {
          elif .local.relation == "missing" then "PR head commit not in local repo; git fetch"
          else empty end),
         (if .local != null and .local.dirty > 0 then "\(.local.dirty) uncommitted local changes" else empty end),
-        ((.checksFailed | length) as $n | if $n > 0 then "\($n) failed checks" else empty end),
+        (([.checksFailed[] | select(.kind == "actions")] | length) as $n | if $n > 0 then "\($n) failed checks" else empty end),
         (if (.checksFailed | length) == 0 and (.checksAwaitingApproval | length) == 0 and ($ci == "FAILURE" or $ci == "ERROR") then "CI reports \($ci | ascii_downcase) but the failing check is not listed" else empty end),
         ((.threadsToAddress | length) as $n | if $n > 0 then "\($n) threads need a response" else empty end),
         ((.threadsToResolve | length) as $n | if $n > 0 then "\($n) answered bot threads to resolve" else empty end),
@@ -403,6 +403,8 @@ status() {
       ],
       human: ([
         (.checksAwaitingApproval[] | "check \(.name) is waiting for someone to approve it"),
+        # an external check (Cloudflare, Vercel) can fail for account reasons the agent cannot fix or re-run
+        (.checksFailed[] | select(.kind == "external") | "check \(.name) failed outside GitHub Actions"),
         (if ($stuckChecks | length) > 0 then "\($stuckChecks | length) checks still running after \($stuck | mins): \($stuckChecks | join(", "))" else empty end),
         ($botsBehind[] | select((.waitedSecs >= $botGrace and (.checksRunning | length) == 0) or gaveUp)
          | if .skippedHead then "\(.bot) skipped reviewing \($p.headRefOid[0:7]) (\(.skipReason))"
@@ -418,13 +420,13 @@ status() {
   | .ready = (.state == "OPEN" and ([.blockers[][]] | length) == 0)
   # a PR watcher (T3 Code) wakes on check results, comments and reviews, never on a grace period
   # running out: CI that never registers, or a review bot that stays silent or whose check hangs.
-  # With a check held for approval, the checks never all finish, so a pass sends no event either.
-  | .wakeOnEvent = ((.checksAwaitingApproval | length) == 0
+  # With a check held for approval or already failed, "all checks passed" never comes either.
+  | .wakeOnEvent = ((.checksAwaitingApproval | length) == 0 and (.checksFailed | length) == 0
                     and (((.checksPending - $stuckChecks | length) > 0
                           and (.blockers.wait | any(test(" is reviewing | to review ")) | not))
                          or (.blockers.wait | any(test("^CI is pending|^GitHub is still computing")))))
   # needs a person even though the rest is still running; say so now, keep watching the rest
-  | .tellUserNow = [.checksAwaitingApproval[] | "check \(.name) is waiting for someone to approve it"]
+  | .tellUserNow = [.blockers.human[] | select(test("^check "))]
   | .nextAction = (if .state != "OPEN" then "stop"
                    elif (.blockers.agent | length) > 0 then "fix"
                    elif (.blockers.wait | length) > 0 then "wait"

@@ -1,6 +1,6 @@
 ---
 name: raise-pr
-description: Implement the agreed plan or discussed change, commit, get up to 3 rounds of cross-review from another agent (Codex gpt-6.1-sol or Claude Opus 5.5), fix findings, open a PR, then baby-sit it until green. Use when the user says "raise a PR", "implement and raise PR", "do it e2e", or "lets do it" after a plan is agreed.
+description: Implement the agreed plan or discussed change, commit, get up to 3 rounds of cross-review from another agent (Codex gpt-6.1-sol or Claude Opus 5.5), fix findings, open a PR, then baby-sit it until green. Use when the user says "raise a PR", "implement and raise PR", "do it e2e", or "lets do it" after a plan is agreed, including when a plan, issue, other command or longer request ends with "raise a PR" or "after finishing, raise a PR". Never open a PR with a bare `gh pr create` instead.
 ---
 
 # Raise PR
@@ -21,12 +21,12 @@ SETUP_CMD="<install deps, e.g. pnpm install --frozen-lockfile --prefer-offline>"
   <this skill's dir>/scripts/cross-review.sh <round> <codex|claude> <prompt-file> [base-branch]
 ```
 
-Run it from the repo root, in the background, and wait for it to finish (no `sleep`); a round takes a few minutes. The script reviews committed work in a throwaway worktree, pins the base on round 1 (rerunning round 1 starts over), and tells the reviewer the round number (and on round 3, that it is the last).
+If `<this skill's dir>/scripts` is missing, ask the user to install the skills. Run it from the repo root, in the background, and wait for it to finish (no `sleep`); a round takes a few minutes. The script reviews committed work in a throwaway worktree, pins the base on round 1 (rerunning round 1 starts over), and tells the reviewer the round number (and on round 3, that it is the last).
 
 **In T3 Code** (`delegate_task` available), delegate instead, so the review is visible and wakes you:
 - Pick the reviewer's model from `orchestrator_capabilities` (gpt-6.1-sol medium, or claude-opus-5-5); if it isn't listed, ask rather than substitute.
-- Build the round's prompt once with `cross-review.sh --prompt-only <same args>`, note `git rev-parse HEAD`, and `delegate_task` the prompt (`mode: "async"`, one `clientRequestId` per round, reused on retries). End your turn; don't edit or commit until it completes.
-- Read it with `task_status`. Accept it only if it completed with review text, and HEAD and a clean `git status` are unchanged; otherwise stop and investigate.
+- Build every round's prompt with `cross-review.sh --prompt-only <same args>` and pass that text itself as the task: tool arguments aren't shell-expanded, so `$(cat …)` or placeholders arrive literally. Use `mode: "async"` and one `clientRequestId` per round, reused on retries. End your turn; don't edit or commit until it completes.
+- Read it with `task_status`. Accept it only if it completed with review text and `cross-review.sh --verify <round>` passes; otherwise stop and investigate.
 
 If a review fails (CLI missing, auth, rate limit, failed or empty task), ask the user whether to switch reviewer or skip; never treat it as `NO FINDINGS`. Before falling back from a delegated review to the CLI, make sure that task is finished or cancelled.
 
@@ -64,11 +64,11 @@ After each round:
 
 ## 3. Open the PR
 
-Push, then `gh pr create --base <base>` (`--draft` only if asked). Body:
-- **Summary:** what and why in a line or two, then the smallest visual that makes the change clear: a diff sketch, call tree, file tree, pseudocode, or Mermaid diagram. Skip the visual for a trivial change.
+Only after cross-review: push, then `gh pr create --base <base> --body-file <a fresh mktemp file>` (`--draft` only if asked). Body (if a `pr` skill is available, write Summary, Evidence and Merge danger with it). No preamble, brief prose, the repo's terms from `GLOSSARY.md` if present:
+- **Summary:** what and why in a line or two, then the smallest visual that makes the change clear, next to the text it supports: a diff sketch, call tree, file tree, pseudocode, or Mermaid diagram. Usually one; skip it for a trivial change.
 - **Spec:** plan path or issue link (`Closes #N` when the PR resolves it), if any.
-- **Evidence:** before and after: the test or command that failed and now passes, its output, or a screenshot for a visual change. List the commands run.
-- **Merge danger:** one-way or two-way door (can it be rolled back cheaply?), and blast radius (what could break, and for whom).
+- **Evidence:** before and after: a screenshot for a visual change (best), else the exact test or command that failed and now passes, with its output. List the commands run.
+- **Merge danger:** one-way or two-way door (can it be rolled back cheaply?), and blast radius: one word, then what could break and for whom.
 - **Cross-review:** reviewer and model (the script output's first line, or the delegated target); per round, fixed and declined (with reason). Mark fixes made after the last round you ran as "not re-reviewed".
 - **Follow-ups:** leftover findings, or "none".
 
