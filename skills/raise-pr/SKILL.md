@@ -64,11 +64,11 @@ After each round:
 
 ## 3. Open the PR
 
-Only after cross-review: push, then `gh pr create --base <base> --body-file <a fresh mktemp file>` (`--draft` only if asked). Body:
-- **Summary:** what and why in a line or two, then the smallest visual that makes the change clear: a diff sketch, call tree, file tree, pseudocode, or Mermaid diagram. Skip the visual for a trivial change.
+Only after cross-review: push, then `gh pr create --base <base> --body-file <a fresh mktemp file>` (`--draft` only if asked). Body (if a `pr` skill is available, write Summary, Evidence and Merge danger with it). No preamble, brief prose, the repo's terms from `GLOSSARY.md` if present:
+- **Summary:** what and why in a line or two, then the smallest visual that makes the change clear, next to the text it supports: a diff sketch, call tree, file tree, pseudocode, or Mermaid diagram. Usually one; skip it for a trivial change.
 - **Spec:** plan path or issue link (`Closes #N` when the PR resolves it), if any.
-- **Evidence:** before and after: the test or command that failed and now passes, its output, or a screenshot for a visual change. List the commands run.
-- **Merge danger:** one-way or two-way door (can it be rolled back cheaply?), and blast radius (what could break, and for whom).
+- **Evidence:** before and after: a screenshot for a visual change (best), else the exact test or command that failed and now passes, with its output. List the commands run.
+- **Merge danger:** one-way or two-way door (can it be rolled back cheaply?), and blast radius: one word, then what could break and for whom.
 - **Cross-review:** reviewer and model (the script output's first line, or the delegated target); per round, fixed and declined (with reason). Mark fixes made after the last round you ran as "not re-reviewed".
 - **Follow-ups:** leftover findings, or "none".
 
