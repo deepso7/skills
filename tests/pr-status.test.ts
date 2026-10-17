@@ -416,7 +416,19 @@ describe("checks", () => {
       { name: "test", url: "https://github.com/o/r/actions/runs/4242/job/9", kind: "actions", runId: "4242" },
       { name: "Vercel", url: "https://vercel.com/x", kind: "external", runId: null },
     ]);
-    expect(s.nextAction).toBe("fix");
+    expect([s.nextAction, s.blockers.agent, s.blockers.human]).toEqual(["fix", ["1 failed checks"], ["check Vercel failed outside GitHub Actions"]]);
+  });
+
+  // minipaw#13, minip2p#354: a Cloudflare check failed for account reasons; nextAction stayed "fix",
+  // so --wait returned at once, and the agent waited on a watcher that never woke it
+  test("a failed external check goes to the user and the wait goes on", () => {
+    const p = pr();
+    (p.commits.nodes[0]!.commit as any).statusCheckRollup = { state: "FAILURE", contexts: { nodes: [
+      { __typename: "CheckRun", name: "Workers Builds", status: "COMPLETED", conclusion: "FAILURE", detailsUrl: "https://dash.cloudflare.com/x", checkSuite: { app: { slug: "cloudflare-workers-and-pages" } } },
+      { __typename: "CheckRun", name: "test", status: "IN_PROGRESS", conclusion: null, detailsUrl: "https://github.com/o/r/actions/runs/1/job/1" },
+    ] } };
+    const s = run(p);
+    expect([s.nextAction, s.wakeOnEvent, s.tellUserNow]).toEqual(["wait", false, ["check Workers Builds failed outside GitHub Actions"]]);
   });
 
   test("r2#6 CI rollup failure/pending is respected even when the check is not listed", () => {

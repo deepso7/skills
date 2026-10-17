@@ -5,6 +5,7 @@ cd "$(dirname "$0")"
 dest="${AGENT_SKILLS_DIR:-$HOME/.agents/skills}"
 claude_dest="${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
 mkdir -p "$dest" "$claude_dest"
+dest="$(cd "$dest" && pwd)"   # symlinks need an absolute target
 for s in skills/*/; do
   name="$(basename "$s")"
   rm -rf "$dest/$name.new" && cp -R "$s" "$dest/$name.new"

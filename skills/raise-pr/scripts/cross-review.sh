@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Usage: cross-review.sh [--prompt-only] <round 1-3> <codex|claude> <prompt-file> [base-branch]
+#        cross-review.sh --verify <round>
 #
 # Runs a read-only review of committed work by another agent, in a throwaway worktree.
 # Prints the review to stdout. The base commit is pinned on round 1 and reused after.
-# --prompt-only prints the reviewer prompt instead, for running the review some other way.
+# --prompt-only prints the reviewer prompt instead, for running the review some other way;
+# --verify then fails if HEAD moved or tracked files changed since that prompt was built.
+# Untracked files are ignored: the reviewer only sees commits.
 #
 # Env: SETUP_CMD  run in the worktree before the review, e.g. "pnpm install --frozen-lockfile --prefer-offline"
 #                 (worktrees start without node_modules; the sandboxed reviewer can't install them)
@@ -11,6 +14,15 @@
 #      CODEX_MODEL / CLAUDE_MODEL / EFFORT   override gpt-6.1-sol / claude-opus-5-5 / medium
 set -euo pipefail
 
+clean() { [[ -z "$(git status --porcelain --untracked-files=no)" ]]; }
+state_dir() { echo "$(git rev-parse --absolute-git-dir)/cross-review/$(git rev-parse --abbrev-ref HEAD | tr '/' '_')"; }
+if [[ "${1:-}" == --verify ]]; then
+  f="$(state_dir)/head-${2:?round}"
+  [[ -f $f ]] || { echo "no --prompt-only run for round $2 on this branch" >&2; exit 2; }
+  clean && [[ "$(git rev-parse HEAD)" == "$(cat "$f")" ]] ||
+    { echo "checkout changed since the round $2 prompt (built for $(cat "$f")); don't accept this review" >&2; exit 3; }
+  echo "checkout unchanged since the round $2 prompt"; exit 0
+fi
 PROMPT_ONLY=""; [[ "${1:-}" == --prompt-only ]] && { PROMPT_ONLY=1; shift; }
 ROUND="${1:?round}"; REVIEWER="${2:?codex|claude}"; PROMPT="$(cd "$(dirname "${3:?prompt file}")" && pwd)/$(basename "$3")"
 BASE="${4:-}"
@@ -23,15 +35,16 @@ case "$REVIEWER" in
 esac
 [[ -r "$PROMPT" ]] || { echo "cannot read $PROMPT" >&2; exit 2; }
 
-[[ -z "$(git status --porcelain)" ]] || { echo "commit your work first: the reviewer only sees commits" >&2; exit 1; }
+clean || { echo "commit your work first: the reviewer only sees commits" >&2; exit 1; }
 
 HEAD_SHA="$(git rev-parse HEAD)"
-STATE="$(git rev-parse --absolute-git-dir)/cross-review/$(git rev-parse --abbrev-ref HEAD | tr '/' '_')"
+STATE="$(state_dir)"
 mkdir -p "$STATE"
 
 if [[ "$ROUND" == 1 || ! -f "$STATE/base.sha" ]]; then
   # base comes from the repository the PR targets; in a fork that is "upstream", not "origin"
   TARGET="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+  for r in $(git remote); do BASE="${BASE#"$r"/}"; done   # "origin/main" -> "main"
   [[ -n "$BASE" ]] || BASE="$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null || echo main)"
   REMOTE="$( [[ -n "$TARGET" ]] && git remote -v | grep -iE "[:/]$TARGET(\.git)?[[:space:]]" | head -1 | cut -f1 || true)"
   git fetch -q "${REMOTE:-origin}" "$BASE"
@@ -49,7 +62,7 @@ BASE_SHA="$(cat "$STATE/base.sha")"
     else echo "To run tests, use \`$TEST_CMD\` (optionally followed by paths or flags) as a plain command: no pipes, redirects, cd, or env prefixes."; fi
   fi
   echo; cat "$PROMPT"; } > "$STATE/prompt-$ROUND.md"
-[[ -n $PROMPT_ONLY ]] && { cat "$STATE/prompt-$ROUND.md"; exit 0; }
+[[ -n $PROMPT_ONLY ]] && { echo "$HEAD_SHA" > "$STATE/head-$ROUND"; cat "$STATE/prompt-$ROUND.md"; exit 0; }
 
 # fresh worktree per round, outside .git (Codex's sandbox protects .git), with its own TMPDIR
 WT="$(mktemp -d "${TMPDIR:-/tmp}/cross-review.XXXXXX")/wt"
@@ -106,7 +119,7 @@ if (( rc != 0 )) || [[ ! -s "$OUT" ]]; then
   exit 5
 fi
 
-[[ -z "$(git status --porcelain)" && "$(git rev-parse HEAD)" == "$HEAD_SHA" ]] ||
+clean && [[ "$(git rev-parse HEAD)" == "$HEAD_SHA" ]] ||
   { echo "WARNING: your checkout changed during review (this review is of $HEAD_SHA); not touching it" >&2; exit 3; }
 echo "Reviewer: $REVIEWER $MODEL (effort $EFFORT), round $ROUND"
 cat "$OUT"
