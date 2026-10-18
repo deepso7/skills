@@ -13,6 +13,7 @@
 #      TEST_CMD   test runner the Claude reviewer may run (e.g. "pnpm test")
 #      CODEX_MODEL / CLAUDE_MODEL / EFFORT   override gpt-6.1-sol / claude-opus-5-5 / medium
 set -euo pipefail
+[[ $# -eq 0 || ${1:-} == -h || ${1:-} == --help ]] && { sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p;}' "$0"; exit 0; }
 
 clean() { [[ -z "$(git status --porcelain --untracked-files=no)" ]]; }
 state_dir() { echo "$(git rev-parse --absolute-git-dir)/cross-review/$(git rev-parse --abbrev-ref HEAD | tr '/' '_')"; }

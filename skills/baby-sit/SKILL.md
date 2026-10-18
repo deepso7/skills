@@ -1,6 +1,6 @@
 ---
 name: baby-sit
-description: Watch one or more GitHub PRs and keep fixing them until green and ready to merge - CI, review-bot comments (CodeRabbit, Greptile, cubic, Copilot), nested thread replies, and human comments. Use whenever the user says "babysit", "watch the PR", "until PR is green", "CI is failing", or "address the review comments", "merge when green", or "are the bot comments sorted", including as the last step of a bigger request, for several PRs at once, or for existing PRs you review and fix one by one; after any push to a PR you opened; and at the end of raise-pr.
+description: Watch one or more GitHub PRs and keep fixing them until green and ready to merge - CI, review-bot comments (CodeRabbit, Greptile, cubic, Copilot), nested thread replies, and human comments. Use whenever the user says "babysit", "watch the PR", "until PR is green", "CI is failing", "address the review comments", "fix and push to the PR", "merge when green", "is it merge ready", or "are the bot comments sorted", including as the last step of a bigger request, for several PRs at once, or for existing PRs you review and fix one by one; after any push to a PR you opened; and at the end of raise-pr.
 ---
 
 # Baby-sit a PR
@@ -24,7 +24,7 @@ Pin the PR number `N` and pass it last to every command (`pr-status.sh --record 
 | `stop` | PR merged or closed; report |
 | `error` | Read `error`. Wait and check once more; if it fails again, stop and report |
 
-`done` means no blockers on the head commit: CI passed (or none registered), and every review bot in `reviewBots` reviewed that commit. Only `pr-status.sh` is a check: a watch notification, `gh pr checks` or `gh pr view` is not, and may be about an older commit. If you filter its JSON, keep `nextAction`, `wakeOnEvent` and `tellUserNow`.
+`done` means no blockers on the head commit: CI passed (or none registered), and every review bot in `reviewBots` reviewed that commit. Only `pr-status.sh` is a check: a watch notification, `gh pr checks` or `gh pr view` is not, and may be about an older commit. If you filter its JSON, keep `nextAction`, `wakeOnEvent` and `tellUserNow`. Asked whether a PR is ready? Run one check and answer from it.
 
 ## Waiting
 
@@ -34,7 +34,7 @@ Use the first mode your environment supports and name it in your first progress 
 2. **Background commands wake you** (Claude Code): run `pr-status.sh --wait N` with the tool's background option (not `&`); on `waitResult: still-waiting`, start it again.
 3. **Neither** (Codex, plain CLI): run `pr-status.sh --wait N` in the foreground (returns within 9 minutes), at most 6 times in a row; then stop, report, and tell the user to ask again later.
 
-In mode 1, end your turn on a `wait` only if the latest check says `wakeOnEvent: true`; otherwise also wait as in mode 2 (or 3). Never end a turn while babysitting unless something will wake you, and never write your own `sleep`, `gh run watch` or `gh pr checks --watch` loops. If `tellUserNow` is not empty, tell the user in one line right away and keep going.
+In mode 1, end your turn on a `wait` only if the latest check says `wakeOnEvent: true`; otherwise also wait as in mode 2 (or 3). Never end a turn while babysitting unless something will wake you, and never write your own `sleep`, `gh run watch` or `gh pr checks --watch` loops. If `tellUserNow` is not empty, tell the user in one line in your next message, not at the final report, and keep going.
 
 After a resume, compaction or server restart, earlier watches and background commands may be gone: call `watch_pull_request` again and restart `--wait`. Any push to the PR, even after the final report, means babysitting again.
 
