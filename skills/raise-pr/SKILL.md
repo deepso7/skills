@@ -25,8 +25,8 @@ If `<this skill's dir>/scripts` is missing, ask the user to install the skills. 
 
 **In T3 Code** (`delegate_task` available), delegate instead, so the review is visible and wakes you:
 - Pick the reviewer's model from `orchestrator_capabilities` (gpt-6.1-sol medium, or claude-opus-5-5); if it isn't listed, ask rather than substitute.
-- Build every round's prompt with `cross-review.sh --prompt-only <same args>` and pass that text itself as the task: tool arguments aren't shell-expanded, so `$(cat …)` or placeholders arrive literally. Use `mode: "async"` and one `clientRequestId` per round, reused on retries. End your turn; don't edit or commit until it completes.
-- Read it with `task_status`. Accept it only if it completed with review text and `cross-review.sh --verify <round>` passes; otherwise stop and investigate.
+- Write the round's brief to a fresh `mktemp` file, build the prompt with `cross-review.sh --prompt-only <same args>` and pass that text itself as the task: tool arguments aren't shell-expanded, so `$(cat …)` or placeholders arrive literally. Use `mode: "async"` and one `clientRequestId` per round, reused on retries. End your turn; don't edit or commit until it completes.
+- Read it with `task_status`. Accept it only if it completed with review text and `cross-review.sh --verify <round>` exits 0 (read its status directly, not through a pipe); otherwise stop and investigate.
 
 If a review fails (CLI missing, auth, rate limit, failed or empty task), ask the user whether to switch reviewer or skip; never treat it as `NO FINDINGS`. Before falling back from a delegated review to the CLI, make sure that task is finished or cancelled.
 
@@ -64,7 +64,7 @@ After each round:
 
 ## 3. Open the PR
 
-Only after cross-review: push, then `gh pr create --base <base> --body-file <a fresh mktemp file>` (`--draft` only if asked). Body (if a `pr` skill is available, write Summary, Evidence and Merge danger with it). No preamble, brief prose, the repo's terms from `GLOSSARY.md` if present:
+Only after cross-review: push, then `gh pr create --base <base> --body-file <a fresh mktemp file>` (`--draft` only if asked). Body (if a `pr` skill is available, write Summary, Evidence and Merge danger with it, then add the rest). No preamble, brief prose, the repo's terms from `GLOSSARY.md` if present:
 - **Summary:** what and why in a line or two, then the smallest visual that makes the change clear, next to the text it supports: a diff sketch, call tree, file tree, pseudocode, or Mermaid diagram. Usually one; skip it for a trivial change.
 - **Spec:** plan path or issue link (`Closes #N` when the PR resolves it), if any.
 - **Evidence:** before and after: a screenshot for a visual change (best), else the exact test or command that failed and now passes, with its output. List the commands run.
@@ -74,4 +74,4 @@ Only after cross-review: push, then `gh pr create --base <base> --body-file <a f
 
 ## 4. Baby-sit
 
-Run the `baby-sit` skill on the new PR, then report its result with the PR URL.
+Load the `baby-sit` skill (with the Skill tool, even if you used it earlier; a PR watch alone is not babysitting) and run it on the new PR, then report its result with the PR URL. After a context compaction, load raise-pr and baby-sit again before going on.
