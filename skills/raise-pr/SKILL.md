@@ -14,7 +14,7 @@ description: Implement the agreed plan or discussed change, commit, get up to 3 
 
 ## 2. Cross-review (up to 3 rounds)
 
-Reviewer is the other agent: `codex` if you are Claude, `claude` if you are Codex, unless the user named one.
+Reviewer is the other agent: `codex` if you are Claude, `claude` if you are Codex, unless the user named one. Write each round's brief (the prompt below) to a fresh `mktemp` file.
 
 ```bash
 SETUP_CMD="<install deps, e.g. pnpm install --frozen-lockfile --prefer-offline>" TEST_CMD="<repo test command>" \
@@ -25,7 +25,7 @@ If `<this skill's dir>/scripts` is missing, ask the user to install the skills. 
 
 **In T3 Code** (`delegate_task` available), delegate instead, so the review is visible and wakes you:
 - Pick the reviewer's model from `orchestrator_capabilities` (gpt-6.1-sol medium, or claude-opus-5-5); if it isn't listed, ask rather than substitute.
-- Write the round's brief to a fresh `mktemp` file, build the prompt with `cross-review.sh --prompt-only <same args>` and pass that text itself as the task: tool arguments aren't shell-expanded, so `$(cat …)` or placeholders arrive literally. Use `mode: "async"` and one `clientRequestId` per round, reused on retries. End your turn; don't edit or commit until it completes.
+- Build the round's prompt with `cross-review.sh --prompt-only <same args>` and pass that text itself as the task: tool arguments aren't shell-expanded, so `$(cat …)` or placeholders arrive literally. Use `mode: "async"` and one `clientRequestId` per round, reused on retries. End your turn; don't edit or commit until it completes.
 - Read it with `task_status`. Accept it only if it completed with review text and `cross-review.sh --verify <round>` exits 0 (read its status directly, not through a pipe); otherwise stop and investigate.
 
 If a review fails (CLI missing, auth, rate limit, failed or empty task), ask the user whether to switch reviewer or skip; never treat it as `NO FINDINGS`. Before falling back from a delegated review to the CLI, make sure that task is finished or cancelled.
@@ -74,4 +74,4 @@ Only after cross-review: push, then `gh pr create --base <base> --body-file <a f
 
 ## 4. Baby-sit
 
-Load the `baby-sit` skill (with the Skill tool, even if you used it earlier; a PR watch alone is not babysitting) and run it on the new PR, then report its result with the PR URL. After a context compaction, load raise-pr and baby-sit again before going on.
+Load the `baby-sit` skill (with the Skill tool, or by rereading its SKILL.md; even if you used it earlier, since a PR watch alone is not babysitting) and run it on the new PR, then report its result with the PR URL. After a context compaction, load raise-pr and baby-sit again before going on.
